@@ -1,0 +1,255 @@
+---
+# =============================================================================
+# Playbook : physical_readiness_report.yml
+# Purpose  : Collect compliance data from remote servers and render it into a
+#            single consolidated HTML report, in the same table layout used
+#            for manual compliance sheets:
+#
+#            Category | Description Item | Compliance | Resolution | Status | Remarks
+#
+#            Categories covered:
+#              - Physical Readiness: Power Redundancy, Fan Redundancy,
+#                Network Redundance  (physical hosts only; VMs = Not Applicable)
+#              - Monitoring: Uptime (Compliant if < 120 days), Disk Utilization
+#                (Compliant if root filesystem usage < 80%)  -- applies to
+#                physical hosts AND VMs
+#
+# Usage    : ansible-playbook -i inventory.ini physical_readiness_report.yml
+#
+# Notes    :
+#   - Physical hosts are probed with dmidecode / ipmitool for PSU + fan
+#     redundancy, and with /proc/net/bonding for NIC redundancy.
+#   - Virtual machines are auto-detected (ansible_virtualization_role) and
+#     marked "Not Applicable" / Remarks = "VM" for Physical Readiness items,
+#     matching the sample sheet. Monitoring items apply regardless of VM/physical.
+#   - Requires: dmidecode (physical hosts), root/become privileges.
+#     ipmitool is optional - used as a fallback for fan data if present.
+# =============================================================================
+
+- name: Collect compliance facts from all target servers
+  hosts: dev
+  become: true
+  gather_facts: true
+  vars:
+    report_dir: "./reports"
+    report_file: "{{ report_dir }}/physical_readiness_report.html"
+    # Category names as variables — override in group_vars/host_vars,
+    # or on the CLI with --extra-vars, without touching the playbook logic.
+    physical_readiness_category_name: "Physical Readiness"
+    monitoring_category_name: "Monitoring"
+
+  tasks:
+
+    - name: Determine if host is a virtual machine
+      ansible.builtin.set_fact:
+        is_vm: "{{ ansible_virtualization_role | default('NA') == 'guest' }}"
+
+    # ------------------------------------------------------------------
+    # POWER REDUNDANCY
+    # ------------------------------------------------------------------
+    - name: Check power supply count via dmidecode (physical hosts only)
+      ansible.builtin.shell: |
+        set -o pipefail
+        dmidecode -t 39 2>/dev/null | grep -c "Power Supply"
+      args:
+        executable: /bin/bash
+      register: psu_count
+      changed_when: false
+      failed_when: false
+      when: not is_vm
+
+    - name: Set Power Redundancy result
+      ansible.builtin.set_fact:
+        power_compliance: >-
+          {{ 'Not Applicable' if is_vm else
+             ('Compliant' if (psu_count.stdout | default('0') | int) >= 2 else 'Non-Compliant') }}
+        power_remarks: >-
+          {{ 'VM' if is_vm else
+             (psu_count.stdout | default('0') ~ ' PSU(s) detected') }}
+
+    # ------------------------------------------------------------------
+    # FAN REDUNDANCY
+    # ------------------------------------------------------------------
+    - name: Check fan count via dmidecode (physical hosts only)
+      ansible.builtin.shell: |
+        set -o pipefail
+        dmidecode -t 27 2>/dev/null | grep -c "Cooling Device"
+      args:
+        executable: /bin/bash
+      register: fan_count
+      changed_when: false
+      failed_when: false
+      when: not is_vm
+
+    - name: Check fan status via ipmitool as fallback (physical hosts only)
+      ansible.builtin.shell: |
+        set -o pipefail
+        ipmitool sdr type fan 2>/dev/null | grep -c "ok"
+      args:
+        executable: /bin/bash
+      register: ipmi_fan_count
+      changed_when: false
+      failed_when: false
+      when: not is_vm
+
+    - name: Set Fan Redundancy result
+      ansible.builtin.set_fact:
+        fan_compliance: >-
+          {{ 'Not Applicable' if is_vm else
+             ('Compliant' if ((fan_count.stdout | default('0') | int) >= 2 or
+                               (ipmi_fan_count.stdout | default('0') | int) >= 2)
+                          else 'Non-Compliant') }}
+        fan_remarks: >-
+          {{ 'VM' if is_vm else
+             ((fan_count.stdout | default('0')) ~ ' fan(s) via dmidecode, ' ~
+              (ipmi_fan_count.stdout | default('0')) ~ ' ok via ipmitool') }}
+
+    # ------------------------------------------------------------------
+    # NETWORK REDUNDANCY
+    # ------------------------------------------------------------------
+    - name: Check for bonded/teamed network interfaces
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls /proc/net/bonding/ 2>/dev/null | wc -l
+      args:
+        executable: /bin/bash
+      register: bond_count
+      changed_when: false
+      failed_when: false
+      when: not is_vm
+
+    - name: Get slave count of first bond interface (if any)
+      ansible.builtin.shell: |
+        set -o pipefail
+        bond=$(ls /proc/net/bonding/ 2>/dev/null | head -n1)
+        if [ -n "$bond" ]; then
+          grep -c "^Slave Interface" /proc/net/bonding/$bond
+        else
+          echo 0
+        fi
+      args:
+        executable: /bin/bash
+      register: bond_slave_count
+      changed_when: false
+      failed_when: false
+      when: not is_vm
+
+    - name: Set Network Redundancy result
+      ansible.builtin.set_fact:
+        network_compliance: >-
+          {{ 'Not Applicable' if is_vm else
+             ('Compliant' if ((bond_count.stdout | default('0') | int) >= 1 and
+                               (bond_slave_count.stdout | default('0') | int) >= 2)
+                          else 'Non-Compliant') }}
+        network_remarks: >-
+          {{ 'VM' if is_vm else
+             ((bond_count.stdout | default('0')) ~ ' bond(s), ' ~
+              (bond_slave_count.stdout | default('0')) ~ ' slave NIC(s) in first bond') }}
+
+    # ------------------------------------------------------------------
+    # MONITORING - UPTIME  (applies to physical hosts AND VMs)
+    # ------------------------------------------------------------------
+    - name: Determine system uptime in days
+      ansible.builtin.set_fact:
+        uptime_days: "{{ (ansible_uptime_seconds | default(0) | int) // 86400 }}"
+
+    - name: Set Uptime compliance result
+      ansible.builtin.set_fact:
+        uptime_compliance: >-
+          {{ 'Compliant' if (uptime_days | int) < 120 else 'Non-Compliant' }}
+        uptime_remarks: "Uptime: {{ uptime_days }} day(s)"
+
+    # ------------------------------------------------------------------
+    # MONITORING - DISK UTILIZATION (root filesystem, applies to all hosts)
+    # ------------------------------------------------------------------
+    - name: Locate root filesystem mount facts
+      ansible.builtin.set_fact:
+        root_mount: "{{ (ansible_mounts | selectattr('mount', 'equalto', '/') | list | first) | default({}) }}"
+
+    - name: Calculate root filesystem disk utilization percentage
+      ansible.builtin.set_fact:
+        disk_used_percent: >-
+          {{ ((1 - ((root_mount.size_available | default(0) | int) /
+                     (root_mount.size_total | default(1) | int))) * 100) | round(2) }}
+      when: root_mount is defined and root_mount
+
+    - name: Set Disk Utilization compliance result
+      ansible.builtin.set_fact:
+        disk_compliance: >-
+          {{ 'Compliant' if (disk_used_percent | default(0) | float) < 80 else 'Non-Compliant' }}
+        disk_remarks: >-
+          {{ ('Disk usage on /: ' ~ disk_used_percent ~ '%') if disk_used_percent is defined
+             else 'Root filesystem not found' }}
+
+    # ------------------------------------------------------------------
+    # Consolidate this host's rows, grouped by category
+    # ------------------------------------------------------------------
+    - name: Build Physical Readiness row set for this host
+      ansible.builtin.set_fact:
+        physical_readiness_rows:
+          - description_item: "Power Redundancy"
+            compliance: "{{ power_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ power_remarks }}"
+          - description_item: "Fan Redundancy"
+            compliance: "{{ fan_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ fan_remarks }}"
+          - description_item: "Network Redundance"
+            compliance: "{{ network_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ network_remarks }}"
+
+    - name: Build Monitoring row set for this host
+      ansible.builtin.set_fact:
+        monitoring_rows:
+          - description_item: "Uptime"
+            compliance: "{{ uptime_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ uptime_remarks }}"
+          - description_item: "Disk Utilization"
+            compliance: "{{ disk_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ disk_remarks }}"
+
+    - name: Build combined category list for this host
+      ansible.builtin.set_fact:
+        compliance_categories:
+          - category: "{{ physical_readiness_category_name }}"
+            rows: "{{ physical_readiness_rows }}"
+          - category: "{{ monitoring_category_name }}"
+            rows: "{{ monitoring_rows }}"
+
+# =============================================================================
+# Render the consolidated HTML report on the control node
+# =============================================================================
+- name: Generate consolidated Physical Readiness HTML report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    report_dir: "./reports"
+    report_file: "{{ report_dir }}/physical_readiness_report.html"
+
+  tasks:
+
+    - name: Ensure report output directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render Physical Readiness HTML report
+      ansible.builtin.template:
+        src: templates/report.html.j2
+        dest: "{{ report_file }}"
+        mode: "0644"
+
+    - name: Show report location
+      ansible.builtin.debug:
+        msg: "Physical Readiness report generated at {{ report_file | realpath }}"
