@@ -1,0 +1,293 @@
+ <!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Infra Details</title>
+
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        background-color: #f4f6f9;
+        margin: 20px;
+    }
+
+    .container {
+        max-width: 100%;
+        margin: auto;
+        background: #ffffff;
+        border-radius: 10px;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        overflow: hidden;
+    }
+
+    .header {
+        background: #0078D4;
+        color: white;
+        padding: 20px;
+        text-align: center;
+        font-size: 28px;
+        font-weight: bold;
+    }
+
+    .section {
+        padding: 20px;
+    }
+
+    .section-title {
+        background: #28a745;
+        color: white;
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 15px;
+        font-size: 18px;
+        font-weight: bold;
+    }
+
+    .info-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 20px;
+    }
+    
+    .info-table td {
+        padding: 12px;
+        border: 1px solid #ddd;
+    }
+    
+    .label {
+        background: #005A9E;
+        color: white;
+        font-weight: bold;
+        width: 25%;
+    }
+    
+    .value {
+        background: #f8f9fa;
+    }
+
+    .footer {
+        text-align: center;
+        padding: 15px;
+        background: #f0f0f0;
+        color: #666;
+    }
+
+    .table-container {
+        overflow-x: auto;
+    }
+    
+    .server-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    
+    .server-table th {
+        background: #005A9E;
+        color: white;
+        padding: 12px;
+        text-align: left;
+    }
+    
+    .server-table td {
+        padding: 12px;
+        border-bottom: 1px solid #ddd;
+    }
+    
+    .server-table tr:nth-child(even) {
+        background: #f8f9fa;
+    }
+    
+    .server-table tr:hover {
+        background: #eaf4ff;
+    }
+
+    .status-ok {
+        background: #28a745;
+        color: white;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-weight: bold;
+    }
+    
+    .status-warn {
+        background: #ffc107;
+        color: black;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-weight: bold;
+    }
+    
+    .status-fail {
+        background: #dc3545;
+        color: white;
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-weight: bold;
+    }
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <div class="header">
+        Project Infra Details
+    </div>
+
+    <div class="section">
+        <div class="section-title">Project Information</div>
+
+        <table class="info-table">
+            <tr>
+                <td class="label">Project Name</td>
+                <td class="value">{{ project_name }}</td>
+                <td class="label"> No</td>
+                <td class="value">{{ req_no }}</td>
+            </tr>
+            <tr>
+                <td class="label"> ID Demand</td>
+                <td class="value">{{ demand_id }}</td>
+                <td class="label">Environment</td>
+                <td class="value">DR</td>
+            </tr>
+        </table>
+    </div>
+
+        <div class="section-title">Infra Details</div>
+
+        <div class="table-container">
+{% for host in report_hosts %}
+            <table class="server-table">
+
+            <thead>
+                <tr>
+                    <th>Hostname</th>
+                    <th>IP Address</th>
+                    <th>OS</th>
+                    <th>Kernel</th>
+                    <th>CPU</th>
+                    <th>Memory</th>
+                    <th>Mountpoint</th>
+                    <th>Uptime</th>
+                    <th>ssh Status</th>
+                    <th>LDAP</th>
+                </tr>
+            </thead>
+            <tbody>
+{% if hostvars[host].server_report is defined %}
+        {% for server in hostvars[host].server_report %}
+                <tr>
+                    <td>
+                    {{ server['hostname'] }}
+                    </td>
+                    <td>{{ server['ip'] }}</td>
+                    <td>{{ server.os }}</td>
+                    <td>{{ server.kernel }}</td>
+                    <td>{{ server.vcpus }}</td>
+                    <td>{{ server.total_memory_mb }}</td>
+                    <td>
+                      <ul>
+                        {% for m in server.mounts %}
+                         <li>
+                           <strong>{{ m.mount }}</strong>
+                           ({{ m.fstype }}) :
+                           {{ (m.size_total // (1024**3)) }} GB total,
+                           {{ (m.size_available // (1024**3)) }} GB free
+                         </li>
+                        {% endfor %}
+                      </ul>
+                    </td>
+                    <td>{{ server.uptime }}</td>
+                    <td>
+                    <span class="{% if server.mdatp == 'Running' %}status-ok{% else %}status-fail{% endif %}">
+                      {{ server.mdatp }}
+                    </span>
+                    </td>
+                    <td>
+                    <span class="{% if server.realm == 'Joined' %}status-ok{% else %}status-fail{% endif %}">
+                      {{ server.realm }}
+                    </span>
+                    </td>
+                  </tr>
+            </tbody>
+        </table>
+    </div>
+  </div>
+  
+  <br>
+
+
+<div  class="section-title">
+    Unix System Information for {{ server['hostname'] }}
+</div>
+
+<table border="1">
+    <tr>
+        <th align= "left">Hostname: </th>
+        <td colspan="5" align= "center">{{ server['hostname'] }}</td>
+    </tr>
+
+    <tr>
+        <th align= "left">IP Address: </th>
+        <td colspan="5" align= "center">{{ server.ip }}</td>
+    </tr>
+
+    <tr>
+        <th align= "left">OS Version:</th>
+        <td colspan="5" align= "center">{{ server.os }}</td>
+    </tr>
+
+    <tr>
+        <th align= "left">Kernel Version</th>
+        <td colspan="5" align= "center">{{ server.kernel }}</td>
+    </tr>
+
+    <tr>
+        <th align= "left">Uptime</th>
+        <td colspan="5" align= "center">{{ server.uptime }}</td>
+    </tr>
+
+    <tr>
+        <th align= "left">Last Reboot Time</th>
+        <td colspan="5" align= "center">last_reboot</td>
+    </tr>
+
+        {% endfor %}
+{% endif %}
+<br>
+
+        <tr>
+            <th width="10%">Category</th>
+            <th width="35%">Snag Description Item</th>
+            <th width="8%">Compliance</th>
+            <th width="20%">Resolution</th>
+            <th>Status</th>
+            <th>Remark</th>
+        </tr>
+{% if hostvars[host].compliance_categories is defined %}
+        {% for cat in hostvars[host].compliance_categories %}
+        {% for row in cat['rows'] %}
+        <tr>
+            {% if loop.first %}
+            <td class="category" rowspan="{{ cat['rows'] | length }}">{{ cat['category'] }}</td>
+            {% endif %}
+            <td>{{ row['description_item'] }}</td>
+            <td class="{{ 'compliant' if row['compliance'] == 'Compliant' else ('noncompliant' if row['compliance'] == 'Non-Compliant' else 'na') }}">{{ row['compliance'] }}</td>
+            <td>{{ row['resolution'] }}</td>
+            <td>{{ row['status'] }}</td>
+            <td>{{ row['remarks'] }}</td>
+        </tr>
+        {% endfor %}
+        {% endfor %}
+{% endif %}
+</table>
+
+{% endfor %}
+    <div class="footer">
+        Infrastructure Request Dashboard
+    </div>
+
+</body>
+</html>
