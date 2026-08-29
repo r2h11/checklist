@@ -1,4 +1,4 @@
- <!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -49,19 +49,19 @@
         border-collapse: collapse;
         margin-bottom: 20px;
     }
-    
+
     .info-table td {
         padding: 12px;
         border: 1px solid #ddd;
     }
-    
+
     .label {
         background: #005A9E;
         color: white;
         font-weight: bold;
         width: 25%;
     }
-    
+
     .value {
         background: #f8f9fa;
     }
@@ -75,29 +75,32 @@
 
     .table-container {
         overflow-x: auto;
+        margin-bottom: 15px;
     }
-    
+
     .server-table {
         width: 100%;
         border-collapse: collapse;
+        margin-bottom: 20px;
     }
-    
+
     .server-table th {
         background: #005A9E;
         color: white;
         padding: 12px;
         text-align: left;
     }
-    
+
     .server-table td {
         padding: 12px;
         border-bottom: 1px solid #ddd;
+        vertical-align: top;
     }
-    
+
     .server-table tr:nth-child(even) {
         background: #f8f9fa;
     }
-    
+
     .server-table tr:hover {
         background: #eaf4ff;
     }
@@ -109,7 +112,7 @@
         border-radius: 12px;
         font-weight: bold;
     }
-    
+
     .status-warn {
         background: #ffc107;
         color: black;
@@ -117,13 +120,33 @@
         border-radius: 12px;
         font-weight: bold;
     }
-    
+
     .status-fail {
         background: #dc3545;
         color: white;
         padding: 4px 10px;
         border-radius: 12px;
         font-weight: bold;
+    }
+
+    td.category {
+        text-align: center;
+        font-weight: bold;
+        background: #eaf4ff;
+    }
+
+    td.compliant {
+        color: #1a7f1a;
+        font-weight: bold;
+    }
+
+    td.noncompliant {
+        color: #dc3545;
+        font-weight: bold;
+    }
+
+    td.na {
+        color: #666;
     }
 </style>
 </head>
@@ -143,151 +166,149 @@
             <tr>
                 <td class="label">Project Name</td>
                 <td class="value">{{ project_name }}</td>
-                <td class="label"> No</td>
+                <td class="label">Request No</td>
                 <td class="value">{{ req_no }}</td>
             </tr>
             <tr>
-                <td class="label"> ID Demand</td>
+                <td class="label">ID Demand</td>
                 <td class="value">{{ demand_id }}</td>
                 <td class="label">Environment</td>
-                <td class="value">DR</td>
+                <td class="value">{{ environment_name }}</td>
             </tr>
         </table>
     </div>
 
+    <div class="section">
         <div class="section-title">Infra Details</div>
 
-        <div class="table-container">
-{% for host in report_hosts %}
-            <table class="server-table">
+        {% for host in report_hosts %}
 
+        <div class="table-container">
+            <table class="server-table">
+                <thead>
+                    <tr>
+                        <th>Hostname</th>
+                        <th>IP Address</th>
+                        <th>OS</th>
+                        <th>Kernel</th>
+                        <th>CPU</th>
+                        <th>Memory</th>
+                        <th>Mountpoint</th>
+                        <th>Uptime</th>
+                        <th>ssh Status</th>
+                        <th>LDAP</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% if hostvars[host]['server_report'] is defined %}
+                {% for server in hostvars[host]['server_report'] %}
+                    <tr>
+                        <td>{{ server['hostname'] }}</td>
+                        <td>{{ server['ip'] }}</td>
+                        <td>{{ server['os'] }}</td>
+                        <td>{{ server['kernel'] }}</td>
+                        <td>{{ server['vcpus'] }}</td>
+                        <td>{{ server['total_memory_mb'] }}</td>
+                        <td>
+                            <ul>
+                            {% for m in server['mounts'] %}
+                                <li>
+                                    <strong>{{ m['mount'] }}</strong>
+                                    ({{ m['fstype'] }}):
+                                    {{ (m['size_total'] // (1024**3)) }} GB total,
+                                    {{ (m['size_available'] // (1024**3)) }} GB free
+                                </li>
+                            {% endfor %}
+                            </ul>
+                        </td>
+                        <td>{{ server['uptime'] }}</td>
+                        <td>
+                            <span class="{{ 'status-ok' if server['mdatp'] == 'Running' else 'status-fail' }}">
+                                {{ server['mdatp'] }}
+                            </span>
+                        </td>
+                        <td>
+                            <span class="{{ 'status-ok' if server['realm'] == 'Joined' else 'status-fail' }}">
+                                {{ server['realm'] }}
+                            </span>
+                        </td>
+                    </tr>
+                {% endfor %}
+                {% endif %}
+                </tbody>
+            </table>
+        </div>
+
+        {% if hostvars[host]['server_report'] is defined %}
+        {% for server in hostvars[host]['server_report'] %}
+        <div class="section-title">Unix System Information for {{ server['hostname'] }}</div>
+
+        <table class="info-table">
+            <tr>
+                <td class="label">Hostname</td>
+                <td class="value" colspan="3">{{ server['hostname'] }}</td>
+            </tr>
+            <tr>
+                <td class="label">IP Address</td>
+                <td class="value" colspan="3">{{ server['ip'] }}</td>
+            </tr>
+            <tr>
+                <td class="label">OS Version</td>
+                <td class="value" colspan="3">{{ server['os'] }}</td>
+            </tr>
+            <tr>
+                <td class="label">Kernel Version</td>
+                <td class="value" colspan="3">{{ server['kernel'] }}</td>
+            </tr>
+            <tr>
+                <td class="label">Uptime</td>
+                <td class="value" colspan="3">{{ server['uptime'] }}</td>
+            </tr>
+        </table>
+        {% endfor %}
+        {% endif %}
+
+        {% if hostvars[host]['compliance_categories'] is defined %}
+        <table class="server-table">
             <thead>
                 <tr>
-                    <th>Hostname</th>
-                    <th>IP Address</th>
-                    <th>OS</th>
-                    <th>Kernel</th>
-                    <th>CPU</th>
-                    <th>Memory</th>
-                    <th>Mountpoint</th>
-                    <th>Uptime</th>
-                    <th>ssh Status</th>
-                    <th>LDAP</th>
+                    <th width="10%">Category</th>
+                    <th width="35%">Snag Description Item</th>
+                    <th width="8%">Compliance</th>
+                    <th width="20%">Resolution</th>
+                    <th>Status</th>
+                    <th>Remark</th>
                 </tr>
             </thead>
             <tbody>
-{% if hostvars[host].server_report is defined %}
-        {% for server in hostvars[host].server_report %}
+            {% for cat in hostvars[host]['compliance_categories'] %}
+            {% for row in cat['rows'] %}
                 <tr>
-                    <td>
-                    {{ server['hostname'] }}
-                    </td>
-                    <td>{{ server['ip'] }}</td>
-                    <td>{{ server.os }}</td>
-                    <td>{{ server.kernel }}</td>
-                    <td>{{ server.vcpus }}</td>
-                    <td>{{ server.total_memory_mb }}</td>
-                    <td>
-                      <ul>
-                        {% for m in server.mounts %}
-                         <li>
-                           <strong>{{ m.mount }}</strong>
-                           ({{ m.fstype }}) :
-                           {{ (m.size_total // (1024**3)) }} GB total,
-                           {{ (m.size_available // (1024**3)) }} GB free
-                         </li>
-                        {% endfor %}
-                      </ul>
-                    </td>
-                    <td>{{ server.uptime }}</td>
-                    <td>
-                    <span class="{% if server.mdatp == 'Running' %}status-ok{% else %}status-fail{% endif %}">
-                      {{ server.mdatp }}
-                    </span>
-                    </td>
-                    <td>
-                    <span class="{% if server.realm == 'Joined' %}status-ok{% else %}status-fail{% endif %}">
-                      {{ server.realm }}
-                    </span>
-                    </td>
-                  </tr>
+                    {% if loop.first %}
+                    <td class="category" rowspan="{{ cat['rows'] | length }}">{{ cat['category'] }}</td>
+                    {% endif %}
+                    <td>{{ row['description_item'] }}</td>
+                    <td class="{{ 'compliant' if row['compliance'] == 'Compliant' else ('noncompliant' if row['compliance'] == 'Non-Compliant' else 'na') }}">{{ row['compliance'] }}</td>
+                    <td>{{ row['resolution'] }}</td>
+                    <td>{{ row['status'] }}</td>
+                    <td>{{ row['remarks'] }}</td>
+                </tr>
+            {% endfor %}
+            {% endfor %}
             </tbody>
         </table>
+        {% endif %}
+
+        <br>
+        {% endfor %}
+
     </div>
-  </div>
-  
-  <br>
 
-
-<div  class="section-title">
-    Unix System Information for {{ server['hostname'] }}
-</div>
-
-<table border="1">
-    <tr>
-        <th align= "left">Hostname: </th>
-        <td colspan="5" align= "center">{{ server['hostname'] }}</td>
-    </tr>
-
-    <tr>
-        <th align= "left">IP Address: </th>
-        <td colspan="5" align= "center">{{ server.ip }}</td>
-    </tr>
-
-    <tr>
-        <th align= "left">OS Version:</th>
-        <td colspan="5" align= "center">{{ server.os }}</td>
-    </tr>
-
-    <tr>
-        <th align= "left">Kernel Version</th>
-        <td colspan="5" align= "center">{{ server.kernel }}</td>
-    </tr>
-
-    <tr>
-        <th align= "left">Uptime</th>
-        <td colspan="5" align= "center">{{ server.uptime }}</td>
-    </tr>
-
-    <tr>
-        <th align= "left">Last Reboot Time</th>
-        <td colspan="5" align= "center">last_reboot</td>
-    </tr>
-
-        {% endfor %}
-{% endif %}
-<br>
-
-        <tr>
-            <th width="10%">Category</th>
-            <th width="35%">Snag Description Item</th>
-            <th width="8%">Compliance</th>
-            <th width="20%">Resolution</th>
-            <th>Status</th>
-            <th>Remark</th>
-        </tr>
-{% if hostvars[host].compliance_categories is defined %}
-        {% for cat in hostvars[host].compliance_categories %}
-        {% for row in cat['rows'] %}
-        <tr>
-            {% if loop.first %}
-            <td class="category" rowspan="{{ cat['rows'] | length }}">{{ cat['category'] }}</td>
-            {% endif %}
-            <td>{{ row['description_item'] }}</td>
-            <td class="{{ 'compliant' if row['compliance'] == 'Compliant' else ('noncompliant' if row['compliance'] == 'Non-Compliant' else 'na') }}">{{ row['compliance'] }}</td>
-            <td>{{ row['resolution'] }}</td>
-            <td>{{ row['status'] }}</td>
-            <td>{{ row['remarks'] }}</td>
-        </tr>
-        {% endfor %}
-        {% endfor %}
-{% endif %}
-</table>
-
-{% endfor %}
     <div class="footer">
         Infrastructure Request Dashboard
     </div>
+
+</div>
 
 </body>
 </html>
