@@ -37,12 +37,42 @@
     # or on the CLI with --extra-vars, without touching the playbook logic.
     physical_readiness_category_name: "Physical Readiness"
     monitoring_category_name: "Monitoring"
+    # CPU utilization compliance threshold (percent). Adjust as needed.
+    cpu_utilization_threshold: 80
 
   tasks:
 
     - name: Determine if host is a virtual machine
       ansible.builtin.set_fact:
         is_vm: "{{ ansible_virtualization_role | default('NA') == 'guest' }}"
+
+    # ------------------------------------------------------------------
+    # HOST INFO HEADER (Hostname, IP address, OS version, Kernel Version)
+    # ------------------------------------------------------------------
+    - name: Build OS version display string
+      ansible.builtin.set_fact:
+        os_version_display: >-
+          {{ (os_short_name_map[ansible_distribution] | default(ansible_distribution))
+             ~ (ansible_distribution_major_version | default('')) }}
+      vars:
+        os_short_name_map:
+          RedHat: "RHEL"
+          CentOS: "CentOS"
+          Ubuntu: "Ubuntu"
+          Debian: "Debian"
+          Fedora: "Fedora"
+          Rocky: "Rocky"
+          AlmaLinux: "Alma"
+
+    - name: Build host info block for this host
+      ansible.builtin.set_fact:
+        host_info:
+          hostname: "{{ ansible_hostname | default(inventory_hostname) }}"
+          ip_address: >-
+            {{ ansible_default_ipv4.address | default(
+                 (ansible_all_ipv4_addresses | default([]) | first) | default('N/A')) }}
+          os_version: "{{ os_version_display }}"
+          kernel_version: "{{ ansible_kernel | default('N/A') }}"
 
     # ------------------------------------------------------------------
     # POWER REDUNDANCY
@@ -182,6 +212,35 @@
              else 'Root filesystem not found' }}
 
     # ------------------------------------------------------------------
+    # MONITORING - CPU UTILIZATION (applies to physical hosts AND VMs)
+    # Samples /proc/stat twice, 1 second apart, to compute % CPU busy time.
+    # ------------------------------------------------------------------
+    - name: Sample CPU utilization from /proc/stat
+      ansible.builtin.shell: |
+        set -o pipefail
+        read cpu user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 rest < /proc/stat
+        sleep 1
+        read cpu user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 rest < /proc/stat
+        total1=$((user1+nice1+system1+idle1+iowait1+irq1+softirq1+steal1))
+        total2=$((user2+nice2+system2+idle2+iowait2+irq2+softirq2+steal2))
+        idle_diff=$((idle2-idle1))
+        total_diff=$((total2-total1))
+        awk "BEGIN {printf \"%.2f\", (1 - ${idle_diff}/${total_diff}) * 100}"
+      args:
+        executable: /bin/bash
+      register: cpu_usage_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Set CPU Utilization compliance result
+      ansible.builtin.set_fact:
+        cpu_used_percent: "{{ cpu_usage_raw.stdout | default(0) | float }}"
+        cpu_compliance: >-
+          {{ 'Compliant' if (cpu_usage_raw.stdout | default(0) | float) < (cpu_utilization_threshold | float)
+             else 'Non-Compliant' }}
+        cpu_remarks: "CPU usage: {{ cpu_usage_raw.stdout | default('N/A') }}%"
+
+    # ------------------------------------------------------------------
     # Consolidate this host's rows, grouped by category
     # ------------------------------------------------------------------
     - name: Build Physical Readiness row set for this host
@@ -216,6 +275,11 @@
             resolution: ""
             status: ""
             remarks: "{{ disk_remarks }}"
+          - description_item: "CPU Utilization"
+            compliance: "{{ cpu_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ cpu_remarks }}"
 
     - name: Build combined category list for this host
       ansible.builtin.set_fact:
@@ -224,6 +288,52 @@
             rows: "{{ physical_readiness_rows }}"
           - category: "{{ monitoring_category_name }}"
             rows: "{{ monitoring_rows }}"
+
+    # ------------------------------------------------------------------
+    # SERVER REPORT (Infra Details table + Unix System Information block)
+    # ------------------------------------------------------------------
+    - name: Check Microsoft Defender (mdatp) service status
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl is-active mdatp 2>/dev/null || echo inactive
+      args:
+        executable: /bin/bash
+      register: mdatp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set mdatp status result
+      ansible.builtin.set_fact:
+        mdatp_status: "{{ 'Running' if (mdatp_check.stdout | default('') | trim) == 'active' else 'Not Running' }}"
+
+    - name: Check domain/LDAP join status via realm
+      ansible.builtin.shell: |
+        set -o pipefail
+        realm list 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: realm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set LDAP/realm join status result
+      ansible.builtin.set_fact:
+        realm_status: >-
+          {{ 'Joined' if ((realm_check.stdout | default('') | trim | length) > 0) else 'Not Joined' }}
+
+    - name: Build server_report entry for this host
+      ansible.builtin.set_fact:
+        server_report:
+          - hostname: "{{ host_info.hostname }}"
+            ip: "{{ host_info.ip_address }}"
+            os: "{{ host_info.os_version }}"
+            kernel: "{{ host_info.kernel_version }}"
+            vcpus: "{{ ansible_processor_vcpus | default(ansible_processor_cores | default('N/A')) }}"
+            total_memory_mb: "{{ ansible_memtotal_mb | default('N/A') }}"
+            mounts: "{{ ansible_mounts | default([]) }}"
+            uptime: "{{ uptime_days }} day(s)"
+            mdatp: "{{ mdatp_status }}"
+            realm: "{{ realm_status }}"
 
 # =============================================================================
 # Render the consolidated HTML report on the control node
@@ -235,6 +345,17 @@
   vars:
     report_dir: "./reports"
     report_file: "{{ report_dir }}/physical_readiness_report.html"
+    # The inventory group that was reported on. Change this here (or
+    # override with -e target_group=<name>) if you rename the group
+    # in inventory.ini — the template itself never references a group
+    # name directly.
+    target_group: dev
+    # Project Information header fields — override per-run with -e, e.g.:
+    #   -e project_name="Order Service Migration" -e req_no=REQ12345 -e demand_id=DEM6789
+    project_name: "CHANGE_ME"
+    req_no: "CHANGE_ME"
+    demand_id: "CHANGE_ME"
+    environment_name: "DR"
 
   tasks:
 
@@ -249,6 +370,8 @@
         src: templates/report.html.j2
         dest: "{{ report_file }}"
         mode: "0644"
+      vars:
+        report_hosts: "{{ groups[target_group] | unique }}"
 
     - name: Show report location
       ansible.builtin.debug:
