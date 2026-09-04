@@ -108,25 +108,41 @@
     .status-ok {
         background: #28a745;
         color: white;
-        padding: 4px 10px;
-        border-radius: 12px;
+        padding: 3px 10px;
+        border: 1px solid #1e7e34;
+        border-radius: 3px;
         font-weight: bold;
+        display: inline-block;
     }
 
     .status-warn {
         background: #ffc107;
         color: black;
-        padding: 4px 10px;
-        border-radius: 12px;
+        padding: 3px 10px;
+        border: 1px solid #d39e00;
+        border-radius: 3px;
         font-weight: bold;
+        display: inline-block;
     }
 
     .status-fail {
         background: #dc3545;
         color: white;
-        padding: 4px 10px;
-        border-radius: 12px;
+        padding: 3px 10px;
+        border: 1px solid #a71d2a;
+        border-radius: 3px;
         font-weight: bold;
+        display: inline-block;
+    }
+
+    .status-na {
+        background: #6c757d;
+        color: white;
+        padding: 3px 10px;
+        border: 1px solid #545b62;
+        border-radius: 3px;
+        font-weight: bold;
+        display: inline-block;
     }
 
     td.category {
@@ -135,18 +151,23 @@
         background: #eaf4ff;
     }
 
-    td.compliant {
-        color: #1a7f1a;
+    .host-link {
+        color: #005A9E;
         font-weight: bold;
+        text-decoration: underline;
+        cursor: pointer;
     }
 
-    td.noncompliant {
-        color: #dc3545;
-        font-weight: bold;
+    .host-link:hover {
+        color: #003a66;
     }
 
-    td.na {
-        color: #666;
+    .sysinfo-block {
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        padding: 10px;
+        margin-bottom: 25px;
+        background: #fafbfc;
     }
 </style>
 </head>
@@ -178,10 +199,11 @@
         </table>
     </div>
 
+    <!-- ================================================================
+         DIVISION 1: Infra Details — one combined table, all servers
+         ================================================================ -->
     <div class="section">
         <div class="section-title">Infra Details</div>
-
-        {% for host in report_hosts %}
 
         <div class="table-container">
             <table class="server-table">
@@ -200,106 +222,128 @@
                     </tr>
                 </thead>
                 <tbody>
+                {% for host in report_hosts %}
                 {% if hostvars[host]['server_report'] is defined %}
                 {% for server in hostvars[host]['server_report'] %}
                     <tr>
-                        <td>{{ server['hostname'] }}</td>
-                        <td>{{ server['ip'] }}</td>
-                        <td>{{ server['os'] }}</td>
-                        <td>{{ server['kernel'] }}</td>
-                        <td>{{ server['vcpus'] }}</td>
-                        <td>{{ server['total_memory_mb'] }}</td>
+                        <td>
+                            <a href="javascript:void(0);" class="host-link"
+                               onclick="toggleSysInfo('sysinfo-{{ server['hostname'] | default('') | replace('.', '-') | replace(' ', '-') }}')">
+                                {{ server['hostname'] | default('') }}
+                            </a>
+                        </td>
+                        <td>{{ server['ip'] | default('') }}</td>
+                        <td>{{ server['os'] | default('') }}</td>
+                        <td>{{ server['kernel'] | default('') }}</td>
+                        <td>{{ server['vcpus'] | default('') }}</td>
+                        <td>{{ server['total_memory_mb'] | default('') }}</td>
                         <td>
                             <ul>
-                            {% for m in server['mounts'] %}
+                            {% for m in server['mounts'] | default([]) %}
                                 <li>
-                                    <strong>{{ m['mount'] }}</strong>
-                                    ({{ m['fstype'] }}):
-                                    {{ (m['size_total'] // (1024**3)) }} GB total,
-                                    {{ (m['size_available'] // (1024**3)) }} GB free
+                                    <strong>{{ m['mount'] | default('') }}</strong>
+                                    ({{ m['fstype'] | default('') }}):
+                                    {{ (m['size_total'] | default(0) // (1024**3)) }} GB total,
+                                    {{ (m['size_available'] | default(0) // (1024**3)) }} GB free
                                 </li>
                             {% endfor %}
                             </ul>
                         </td>
-                        <td>{{ server['uptime'] }}</td>
+                        <td>{{ server['uptime'] | default('') }}</td>
                         <td>
-                            <span class="{{ 'status-ok' if server['mdatp'] == 'Running' else 'status-fail' }}">
-                                {{ server['mdatp'] }}
+                            <span class="{{ 'status-ok' if server['mdatp'] | default('') == 'Running' else 'status-fail' }}">
+                                {{ server['mdatp'] | default('N/A') }}
                             </span>
                         </td>
                         <td>
-                            <span class="{{ 'status-ok' if server['realm'] == 'Joined' else 'status-fail' }}">
-                                {{ server['realm'] }}
+                            <span class="{{ 'status-ok' if server['realm'] | default('') == 'Joined' else 'status-fail' }}">
+                                {{ server['realm'] | default('N/A') }}
                             </span>
                         </td>
                     </tr>
                 {% endfor %}
                 {% endif %}
+                {% endfor %}
                 </tbody>
             </table>
         </div>
+    </div>
 
+    <!-- ================================================================
+         DIVISION 2: System Information — every server's detail panel
+         (click a hostname above to jump to / reveal its panel here)
+         ================================================================ -->
+    <div class="section">
+        <div class="section-title">System Information</div>
+
+        {% for host in report_hosts %}
         {% if hostvars[host]['server_report'] is defined %}
         {% for server in hostvars[host]['server_report'] %}
-        <div class="section-title">Unix System Information for {{ server['hostname'] }}</div>
+        <div id="sysinfo-{{ server['hostname'] | default('') | replace('.', '-') | replace(' ', '-') }}" class="sysinfo-block" style="display: none;">
 
-        <table class="info-table">
-            <tr>
-                <td class="label">Hostname</td>
-                <td class="value" colspan="3">{{ server['hostname'] }}</td>
-            </tr>
-            <tr>
-                <td class="label">IP Address</td>
-                <td class="value" colspan="3">{{ server['ip'] }}</td>
-            </tr>
-            <tr>
-                <td class="label">OS Version</td>
-                <td class="value" colspan="3">{{ server['os'] }}</td>
-            </tr>
-            <tr>
-                <td class="label">Kernel Version</td>
-                <td class="value" colspan="3">{{ server['kernel'] }}</td>
-            </tr>
-            <tr>
-                <td class="label">Uptime</td>
-                <td class="value" colspan="3">{{ server['uptime'] }}</td>
-            </tr>
-        </table>
+            <div class="section-title">Unix System Information for {{ server['hostname'] | default('') }}</div>
+
+            <table class="info-table">
+                <tr>
+                    <td class="label">Hostname</td>
+                    <td class="value" colspan="3">{{ server['hostname'] | default('') }}</td>
+                </tr>
+                <tr>
+                    <td class="label">IP Address</td>
+                    <td class="value" colspan="3">{{ server['ip'] | default('') }}</td>
+                </tr>
+                <tr>
+                    <td class="label">OS Version</td>
+                    <td class="value" colspan="3">{{ server['os'] | default('') }}</td>
+                </tr>
+                <tr>
+                    <td class="label">Kernel Version</td>
+                    <td class="value" colspan="3">{{ server['kernel'] | default('') }}</td>
+                </tr>
+                <tr>
+                    <td class="label">Uptime</td>
+                    <td class="value" colspan="3">{{ server['uptime'] | default('') }}</td>
+                </tr>
+            </table>
+
+            {% if hostvars[host]['compliance_categories'] is defined %}
+            <table class="server-table">
+                <thead>
+                    <tr>
+                        <th width="10%">Category</th>
+                        <th width="35%">Snag Description Item</th>
+                        <th width="8%">Compliance</th>
+                        <th width="20%">Resolution</th>
+                        <th>Status</th>
+                        <th>Remark</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for cat in hostvars[host]['compliance_categories'] %}
+                {% for row in cat['rows'] %}
+                    <tr>
+                        {% if loop.first %}
+                        <td class="category" rowspan="{{ cat['rows'] | length }}">{{ cat['category'] }}</td>
+                        {% endif %}
+                        <td>{{ row['description_item'] | default('') }}</td>
+                        <td>
+                            <span class="{{ 'status-ok' if row['compliance'] | default('') == 'Compliant' else ('status-fail' if row['compliance'] | default('') == 'Non-Compliant' else 'status-na') }}">
+                                {{ row['compliance'] | default('') }}
+                            </span>
+                        </td>
+                        <td>{{ row['resolution'] | default('') }}</td>
+                        <td>{{ row['status'] | default('') }}</td>
+                        <td>{{ row['remarks'] | default('') }}</td>
+                    </tr>
+                {% endfor %}
+                {% endfor %}
+                </tbody>
+            </table>
+            {% endif %}
+
+        </div>
         {% endfor %}
         {% endif %}
-
-        {% if hostvars[host]['compliance_categories'] is defined %}
-        <table class="server-table">
-            <thead>
-                <tr>
-                    <th width="10%">Category</th>
-                    <th width="35%">Snag Description Item</th>
-                    <th width="8%">Compliance</th>
-                    <th width="20%">Resolution</th>
-                    <th>Status</th>
-                    <th>Remark</th>
-                </tr>
-            </thead>
-            <tbody>
-            {% for cat in hostvars[host]['compliance_categories'] %}
-            {% for row in cat['rows'] %}
-                <tr>
-                    {% if loop.first %}
-                    <td class="category" rowspan="{{ cat['rows'] | length }}">{{ cat['category'] }}</td>
-                    {% endif %}
-                    <td>{{ row['description_item'] }}</td>
-                    <td class="{{ 'compliant' if row['compliance'] == 'Compliant' else ('noncompliant' if row['compliance'] == 'Non-Compliant' else 'na') }}">{{ row['compliance'] }}</td>
-                    <td>{{ row['resolution'] }}</td>
-                    <td>{{ row['status'] }}</td>
-                    <td>{{ row['remarks'] }}</td>
-                </tr>
-            {% endfor %}
-            {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-
-        <br>
         {% endfor %}
 
     </div>
@@ -309,6 +353,18 @@
     </div>
 
 </div>
+
+<script>
+function toggleSysInfo(id) {
+    var el = document.getElementById(id);
+    if (!el) { return; }
+    var opening = (el.style.display === 'none' || el.style.display === '');
+    el.style.display = opening ? 'block' : 'none';
+    if (opening) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+}
+</script>
 
 </body>
 </html>
