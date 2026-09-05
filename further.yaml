@@ -1,0 +1,214 @@
+---
+# ============================================================================
+# Compliance Check Playbook
+# Re-implements: cra_status, sat_status, sys_status, gim_status
+# Produces a single HTML compliance report per host (and optionally a
+# combined fleet-wide report on the control node).
+# ============================================================================
+- name: Server compliance checks (crash dump, satellite, syslog, guardium)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    crash_memory_threshold_gb: 32
+    satellite_host: "meylvrhsa01.corp.du.ae"
+    satellite_port: 443
+    satellite_timeout_seconds: 2
+    syslog_message_file: "/var/log/messages"      # override per-OS in host_vars if needed
+    report_dir_remote: "/tmp/compliance_report"
+    report_dir_local: "./compliance_reports"
+
+  tasks:
+
+    # ------------------------------------------------------------------
+    # 1. Crash dump check
+    # ------------------------------------------------------------------
+    - name: Get total memory in GB
+      ansible.builtin.set_fact:
+        total_mem_gb: "{{ (ansible_memtotal_mb / 1024) | round(0, 'floor') | int }}"
+
+    - name: Check for a crash mountpoint
+      ansible.builtin.shell: |
+        set -o pipefail
+        df -h | grep -i crash
+      args:
+        executable: /bin/bash
+      register: crash_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate crash dump compliance
+      ansible.builtin.set_fact:
+        cra_control: "Crash dump configured with enough space and to be configured as separate file system if memory >= 32GB"
+        cra_status: >-
+          {%- if total_mem_gb | int <= crash_memory_threshold_gb | int -%}
+          Compliant
+          {%- elif total_mem_gb | int > crash_memory_threshold_gb | int and crash_mount_check.rc == 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        cra_detail: >-
+          {%- if total_mem_gb | int <= crash_memory_threshold_gb | int -%}
+          Crash mountpoint not needed, Total Memory ({{ total_mem_gb }}GB) is less than or equal to {{ crash_memory_threshold_gb }} GB
+          {%- elif crash_mount_check.rc == 0 -%}
+          Crash mountpoint present
+          {%- else -%}
+          No crash mountpoint found and Total Memory ({{ total_mem_gb }}GB) exceeds {{ crash_memory_threshold_gb }} GB
+          {%- endif -%}
+
+    # ------------------------------------------------------------------
+    # 2. Satellite communication check
+    # ------------------------------------------------------------------
+    - name: Test satellite endpoint connectivity
+      ansible.builtin.wait_for:
+        host: "{{ satellite_host }}"
+        port: "{{ satellite_port }}"
+        timeout: "{{ satellite_timeout_seconds }}"
+        state: started
+      register: sat_check
+      failed_when: false
+
+    - name: Evaluate satellite compliance
+      ansible.builtin.set_fact:
+        sat_control: "Ensure satellite communication should be enabled"
+        sat_status: "{{ 'Compliant' if sat_check.state is defined and sat_check.state == 'started' else 'Not Compliant' }}"
+        sat_detail: "{{ satellite_host }}:{{ satellite_port }} {{ 'reachable' if sat_check.state is defined and sat_check.state == 'started' else 'unreachable' }}"
+
+    # ------------------------------------------------------------------
+    # 3. Syslog integration check
+    # ------------------------------------------------------------------
+    - name: Check rsyslog service state
+      ansible.builtin.systemd:
+        name: rsyslog
+      register: rsyslog_service
+      failed_when: false
+
+    - name: Check syslog message file has content
+      ansible.builtin.stat:
+        path: "{{ syslog_message_file }}"
+      register: syslog_file_stat
+
+    - name: Evaluate syslog compliance
+      ansible.builtin.set_fact:
+        sys_control: "Syslog integration and confirmation by TSRM"
+        sys_status: >-
+          {%- if rsyslog_service.status is defined and rsyslog_service.status.ActiveState == 'active' and syslog_file_stat.stat.exists and syslog_file_stat.stat.size > 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        sys_detail: >-
+          rsyslog active: {{ rsyslog_service.status.ActiveState | default('unknown') }},
+          {{ syslog_message_file }} exists: {{ syslog_file_stat.stat.exists | default(false) }},
+          size: {{ syslog_file_stat.stat.size | default(0) }} bytes
+
+    # ------------------------------------------------------------------
+    # 4. Guardium agent (GIM) check
+    # ------------------------------------------------------------------
+    - name: Check for oracle OS user
+      ansible.builtin.command: getent passwd oracle
+      register: oracle_user_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check for running GIM process
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -ef | grep '[g]im'
+      args:
+        executable: /bin/bash
+      register: gim_process_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check for running Oracle PMON process
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -ef | grep '[p]mon'
+      args:
+        executable: /bin/bash
+      register: pmon_process_check
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate Guardium compliance
+      ansible.builtin.set_fact:
+        gim_control: "Guardium Agent installation and confirmation by TSRM"
+        gim_status: >-
+          {%- if oracle_user_check.rc == 0 and gim_process_check.rc == 0 -%}
+          Compliant
+          {%- elif pmon_process_check.rc != 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        gim_detail: >-
+          {%- if oracle_user_check.rc == 0 and gim_process_check.rc == 0 -%}
+          Guardium agent running
+          {%- elif pmon_process_check.rc != 0 -%}
+          No Database available (no Oracle PMON process running)
+          {%- else -%}
+          Please secure ISRM approval for Guardium Installation
+          {%- endif -%}
+
+    # ------------------------------------------------------------------
+    # Assemble per-host results and render HTML report
+    # ------------------------------------------------------------------
+    - name: Build results list for this host
+      ansible.builtin.set_fact:
+        compliance_results:
+          - control: "{{ cra_control }}"
+            status: "{{ cra_status | trim }}"
+            detail: "{{ cra_detail | trim }}"
+          - control: "{{ sat_control }}"
+            status: "{{ sat_status | trim }}"
+            detail: "{{ sat_detail | trim }}"
+          - control: "{{ sys_control }}"
+            status: "{{ sys_status | trim }}"
+            detail: "{{ sys_detail | trim }}"
+          - control: "{{ gim_control }}"
+            status: "{{ gim_status | trim }}"
+            detail: "{{ gim_detail | trim }}"
+
+    - name: Ensure remote report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir_remote }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render per-host HTML compliance report
+      ansible.builtin.template:
+        src: templates/compliance_report.html.j2
+        dest: "{{ report_dir_remote }}/{{ inventory_hostname }}_compliance.html"
+        mode: "0644"
+
+    - name: Fetch report back to control node
+      ansible.builtin.fetch:
+        src: "{{ report_dir_remote }}/{{ inventory_hostname }}_compliance.html"
+        dest: "{{ report_dir_local }}/{{ inventory_hostname }}_compliance.html"
+        flat: true
+
+    - name: Show summary on screen
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ item.control }} -> {{ item.status }}"
+      loop: "{{ compliance_results }}"
+      loop_control:
+        label: "{{ item.control }}"
+
+# ============================================================================
+# Optional: build one combined fleet-wide HTML report on the control node
+# ============================================================================
+- name: Build combined fleet compliance report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    report_dir_local: "./compliance_reports"
+  tasks:
+    - name: Render combined report
+      ansible.builtin.template:
+        src: templates/compliance_report_all.html.j2
+        dest: "{{ report_dir_local }}/all_hosts_compliance.html"
+        mode: "0644"
