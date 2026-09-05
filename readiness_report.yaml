@@ -1,0 +1,453 @@
+---
+# =============================================================================
+# Playbook : physical_readiness_report.yml
+# Purpose  : Collect compliance data from remote servers and render it into a
+#            single consolidated HTML report, in the same table layout used
+#            for manual compliance sheets:
+#
+#            Category | Description Item | Compliance | Resolution | Status | Remarks
+#
+#            Categories covered:
+#              - Physical Readiness: Power Redundancy, Fan Redundancy,
+#                Network Redundance  (physical hosts only; VMs = Not Applicable)
+#              - Monitoring: Uptime (Compliant if < 120 days), Disk Utilization
+#                (Compliant if root filesystem usage < 80%)  -- applies to
+#                physical hosts AND VMs
+#
+# Usage    : ansible-playbook -i inventory.ini physical_readiness_report.yml
+#
+# Notes    :
+#   - Physical hosts are probed with dmidecode / ipmitool for PSU + fan
+#     redundancy, and with /proc/net/bonding for NIC redundancy.
+#   - Virtual machines are auto-detected (ansible_virtualization_role) and
+#     marked "Not Applicable" / Remarks = "VM" for Physical Readiness items,
+#     matching the sample sheet. Monitoring items apply regardless of VM/physical.
+#   - Requires: dmidecode (physical hosts), root/become privileges.
+#     ipmitool is optional - used as a fallback for fan data if present.
+# =============================================================================
+
+- name: Collect compliance facts from all target servers
+  hosts: dev
+  become: true
+  gather_facts: true
+  vars:
+    report_dir: "./reports"
+    report_file: "{{ report_dir }}/physical_readiness_report.html"
+    # Category names as variables — override in group_vars/host_vars,
+    # or on the CLI with --extra-vars, without touching the playbook logic.
+    physical_readiness_category_name: "Physical Readiness"
+    monitoring_category_name: "Monitoring"
+    security_category_name: "Security"
+    configuration_category_name: "Configuration"
+    cluster_category_name: "Cluster"
+    # CPU utilization compliance threshold (percent). Adjust as needed.
+    cpu_utilization_threshold: 80
+    # Memory utilization compliance threshold (percent). Adjust as needed.
+    memory_utilization_threshold: 80
+    # Password policy compliance targets (/etc/login.defs)
+    password_policy_max_days: 60
+    password_policy_min_days: 1
+    password_policy_warn_age: 10
+    # Accounts allowed to keep "(ALL)" sudo/root access in /etc/sudoers
+    # without being flagged as a compliance issue.
+    sudoers_exempt_accounts:
+      - root
+      - sysadm
+      - dmidecode
+      - qualyadm
+      - wheel
+      - gsitdatabaseadministration
+
+  tasks:
+
+     # Consolidate this host's rows, grouped by category
+    # ------------------------------------------------------------------
+    - name: Build Physical Readiness row set for this host
+      ansible.builtin.set_fact:
+        physical_readiness_rows:
+          - description_item: "Power Redundancy"
+            compliance: "{{ power_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ power_remarks }}"
+          - description_item: "Fan Redundancy"
+            compliance: "{{ fan_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ fan_remarks }}"
+          - description_item: "Network Redundance"
+            compliance: "{{ network_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ network_remarks }}"
+
+    - name: Build Monitoring row set for this host
+      ansible.builtin.set_fact:
+        monitoring_rows:
+          - description_item: "Uptime"
+            compliance: "{{ uptime_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ uptime_remarks }}"
+          - description_item: "Disk Utilization"
+            compliance: "{{ disk_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ disk_remarks }}"
+          - description_item: "CPU Utilization"
+            compliance: "{{ cpu_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ cpu_remarks }}"
+          - description_item: "Memory Utilization"
+            compliance: "{{ memory_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ memory_remarks }}"
+
+    # ------------------------------------------------------------------
+    # SECURITY - SMTP CONFIGURED (sendmail or postfix)
+    # ------------------------------------------------------------------
+    - name: Check SMTP (sendmail/postfix) configuration status
+      ansible.builtin.shell: |
+        set -o pipefail
+        if grep -q "DSsmtpint" /etc/mail/sendmail.cf 2>/dev/null && systemctl is-active --quiet sendmail 2>/dev/null; then
+          echo "Compliant|sendmail"
+        elif grep -q "smtpint" /etc/postfix/main.cf 2>/dev/null && systemctl is-active --quiet postfix 2>/dev/null; then
+          echo "Compliant|postfix"
+        else
+          echo "Non-Compliant|none"
+        fi
+      args:
+        executable: /bin/bash
+      register: smtp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set SMTP Configured compliance result
+      ansible.builtin.set_fact:
+        smtp_compliance: "{{ (smtp_check.stdout | default('Non-Compliant|none')).split('|')[0] }}"
+        smtp_remarks: >-
+          {{ 'Postfix installed and running'
+             if ((smtp_check.stdout | default('Non-Compliant|none')).split('|')[1]) == 'postfix'
+             else ('sendmail installed and running'
+                   if ((smtp_check.stdout | default('Non-Compliant|none')).split('|')[1]) == 'sendmail'
+                   else '') }}
+
+    # ------------------------------------------------------------------
+    # SECURITY - EXPLORER / CFG2HTML CONFIGURATION ON OS
+    # ------------------------------------------------------------------
+    - name: Check cfg2html/Explorer configuration on OS
+      ansible.builtin.shell: |
+        set -o pipefail
+        if crontab -l 2>/dev/null | grep -qw cfg2html-linux && ls /usr/sbin/ 2>/dev/null | grep -q cfg2html-linux; then
+          echo "Compliant"
+        else
+          echo "Non-Compliant"
+        fi
+      args:
+        executable: /bin/bash
+      register: cfg2html_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set cfg2html compliance result
+      ansible.builtin.set_fact:
+        cfg2html_compliance: "{{ cfg2html_check.stdout | default('Non-Compliant') | trim }}"
+
+    # ------------------------------------------------------------------
+    # SECURITY - ROOT ACCESS RESTRICTION (sudoers audit)
+    # Flags any account with "(ALL)" sudo access in /etc/sudoers that is
+    # not in the sudoers_exempt_accounts allow-list.
+    # ------------------------------------------------------------------
+    - name: Identify sudoers accounts with ALL privileges (excluding approved admins)
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep "(ALL)" /etc/sudoers 2>/dev/null | grep -Ev "^#|{{ sudoers_exempt_accounts | join('|') }}" | awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: sudoers_extra_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set root access restriction compliance result
+      ansible.builtin.set_fact:
+        sudoers_extra_users: "{{ sudoers_extra_check.stdout_lines | default([]) }}"
+        sudoers_compliance: >-
+          {{ 'Non-Compliant' if (sudoers_extra_check.stdout_lines | default([]) | length) > 0 else 'Compliant' }}
+        sudoers_resolution: >-
+          {{ ('%s have root access' % (sudoers_extra_check.stdout_lines | default([]) | join(', ')))
+             if (sudoers_extra_check.stdout_lines | default([]) | length) > 0 else '' }}
+        sudoers_remarks: >-
+          {{ 'Root Access can be revoked post handover'
+             if (sudoers_extra_check.stdout_lines | default([]) | length) > 0 else '' }}
+
+    - name: Build Security row set for this host
+      ansible.builtin.set_fact:
+        security_rows:
+          - description_item: "SMTP Configured"
+            compliance: "{{ smtp_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ smtp_remarks }}"
+          - description_item: "Explorer or cfg2html configuration on OS"
+            compliance: "{{ cfg2html_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: ""
+          - description_item: "Root password restriction (Only sys admins are allowed to use root)"
+            compliance: "{{ sudoers_compliance }}"
+            resolution: "{{ sudoers_resolution }}"
+            status: ""
+            remarks: "{{ sudoers_remarks }}"
+
+    # ------------------------------------------------------------------
+    # CONFIGURATION - NTP/CHRONY SYNCHRONIZATION
+    # ------------------------------------------------------------------
+    - name: Get configured NTP/Chrony servers
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep server /etc/chrony.conf 2>/dev/null | grep -v "#"
+      args:
+        executable: /bin/bash
+      register: chrony_servers_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check chronyd service is active
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl is-active --quiet chronyd
+      args:
+        executable: /bin/bash
+      register: chronyd_active_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set Chrony/NTP compliance result
+      ansible.builtin.set_fact:
+        chrony_compliance: >-
+          {{ 'Compliant'
+             if ((chrony_servers_check.stdout | default('') | trim | length) > 0 and
+                 (chronyd_active_check.rc | default(1)) == 0)
+             else 'Non-Compliant' }}
+
+    - name: Set Chrony/NTP remarks
+      ansible.builtin.set_fact:
+        chrony_remarks: "{{ '' if chrony_compliance == 'Compliant' else 'Service is not running or NTP Server not configured' }}"
+
+    # ------------------------------------------------------------------
+    # CONFIGURATION - PASSWORD POLICY (/etc/login.defs)
+    # ------------------------------------------------------------------
+    - name: Gather password policy settings from /etc/login.defs
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -E "PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_MIN_LEN|PASS_WARN_AGE" /etc/login.defs | grep -v "#"
+      args:
+        executable: /bin/bash
+      register: login_defs_check
+      changed_when: false
+      failed_when: false
+
+    - name: Extract individual password policy values
+      ansible.builtin.set_fact:
+        pass_max_days: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_MAX_DAYS\\s+(\\d+)') | first) | default('') }}"
+        pass_min_days: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_MIN_DAYS\\s+(\\d+)') | first) | default('') }}"
+        pass_min_len: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_MIN_LEN\\s+(\\d+)') | first) | default('') }}"
+        pass_warn_age: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_WARN_AGE\\s+(\\d+)') | first) | default('') }}"
+
+    - name: Set Password Policy compliance result
+      ansible.builtin.set_fact:
+        password_policy_compliance: >-
+          {{ 'Compliant'
+             if (pass_max_days == (password_policy_max_days | string) and
+                 pass_min_days == (password_policy_min_days | string) and
+                 pass_warn_age == (password_policy_warn_age | string))
+             else 'Non-Compliant' }}
+
+    - name: Set Password Policy resolution detail
+      ansible.builtin.set_fact:
+        password_policy_resolution: "{{ '' if password_policy_compliance == 'Compliant' else (login_defs_check.stdout | default('')) }}"
+
+    - name: Build Configuration row set for this host
+      ansible.builtin.set_fact:
+        configuration_rows:
+          - description_item: "Synchronization with NTP/Chrony Server and ensure 4 NTP servers should be configured on upcoming project"
+            compliance: "{{ chrony_compliance }}"
+            resolution: "{{ chrony_servers_check.stdout | default('') | trim }}"
+            status: ""
+            remarks: "{{ chrony_remarks }}"
+          - description_item: "Password Policy compliance"
+            compliance: "{{ password_policy_compliance }}"
+            resolution: "{{ password_policy_resolution }}"
+            status: ""
+            remarks: ""
+
+    # ------------------------------------------------------------------
+    # CLUSTER - Pacemaker/Corosync (only evaluated if pcs/cluster tooling
+    # is present; otherwise every item is marked Not Applicable)
+    # ------------------------------------------------------------------
+    - name: Check if this host is part of a Pacemaker/Corosync cluster
+      ansible.builtin.shell: |
+        set -o pipefail
+        command -v pcs >/dev/null 2>&1 && pcs status >/dev/null 2>&1
+      args:
+        executable: /bin/bash
+      register: cluster_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set cluster availability fact
+      ansible.builtin.set_fact:
+        is_cluster: "{{ (cluster_check.rc | default(1)) == 0 }}"
+
+    - name: Check Pacemaker cluster node status
+      ansible.builtin.shell: |
+        set -o pipefail
+        pcs cluster status 2>/dev/null | grep Online
+      args:
+        executable: /bin/bash
+      register: cls_check
+      changed_when: false
+      failed_when: false
+      when: is_cluster
+
+    - name: Check corosync heartbeat/totem token value
+      ansible.builtin.shell: |
+        set -o pipefail
+        corosync-cmapctl 2>/dev/null | grep totem.token | grep -v '\.totem\.token'
+      args:
+        executable: /bin/bash
+      register: totem_check
+      changed_when: false
+      failed_when: false
+      when: is_cluster
+
+    - name: Check kdump/fence resource grouping in Pacemaker
+      ansible.builtin.shell: |
+        set -o pipefail
+        pcs resource 2>/dev/null | grep -E "vmfence|kdump"
+      args:
+        executable: /bin/bash
+      register: kf_check
+      changed_when: false
+      failed_when: false
+      when: is_cluster
+
+    - name: Set cluster sub-check compliance results
+      ansible.builtin.set_fact:
+        cls_compliance: "{{ 'Compliant' if (cls_check.rc | default(1)) == 0 else 'Non-Compliant' }}"
+        totem_compliance: "{{ 'Compliant' if (totem_check.stdout | default('') | trim | length) > 0 else 'Non-Compliant' }}"
+        kf_compliance: "{{ 'Compliant' if (kf_check.rc | default(1)) != 0 else 'Non-Compliant' }}"
+      when: is_cluster
+
+    - name: Build Cluster row set when cluster is available
+      ansible.builtin.set_fact:
+        cluster_rows:
+          - description_item: "Cluster Healthcheck. All vendor specific parameters to be configured. Timeout to be configured, failover test, vMotion test etc."
+            compliance: "Pending"
+            resolution: ""
+            status: ""
+            remarks: "Unix Ops to Validate"
+          - description_item: "Cluster health check"
+            compliance: "{{ cls_compliance }}"
+            resolution: "{{ cls_check.stdout | default('') | trim }}"
+            status: ""
+            remarks: ""
+          - description_item: "heartbeat/totem token value"
+            compliance: "{{ totem_compliance }}"
+            resolution: "{{ totem_check.stdout | default('') | trim }}"
+            status: ""
+            remarks: ""
+          - description_item: "Kdump and Fence resources should not be part of any resource group"
+            compliance: "{{ kf_compliance }}"
+            resolution: ""
+            status: "{{ (kf_check.stdout | default('') | trim) if kf_compliance == 'Non-Compliant' else '' }}"
+            remarks: ""
+      when: is_cluster
+
+    - name: Build Cluster row set when cluster is not available
+      ansible.builtin.set_fact:
+        cluster_rows:
+          - description_item: "Cluster Healthcheck. All vendor specific parameters to be configured. Timeout to be configured, failover test, vMotion test etc."
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Cluster is not available"
+          - description_item: "Cluster health check"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Cluster is not available"
+          - description_item: "heartbeat/totem token value"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Cluster is not available"
+          - description_item: "Kdump and Fence resources should not be part of any resource group"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Cluster is not available"
+      when: not is_cluster
+
+    - name: Build combined category list for this host
+      ansible.builtin.set_fact:
+        compliance_categories:
+          - category: "{{ physical_readiness_category_name }}"
+            rows: "{{ physical_readiness_rows }}"
+          - category: "{{ monitoring_category_name }}"
+            rows: "{{ monitoring_rows }}"
+          - category: "{{ security_category_name }}"
+            rows: "{{ security_rows }}"
+          - category: "{{ configuration_category_name }}"
+            rows: "{{ configuration_rows }}"
+          - category: "{{ cluster_category_name }}"
+            rows: "{{ cluster_rows }}"
+
+    # ------------------------------------------------------------------
+    # SERVER REPORT (Infra Details table + Unix System Information block)
+    # ------------------------------------------------------------------
+    - name: Check Microsoft Defender (mdatp) service status
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl is-active mdatp 2>/dev/null || echo inactive
+      args:
+        executable: /bin/bash
+      register: mdatp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set mdatp status result
+      ansible.builtin.set_fact:
+        mdatp_status: "{{ 'Running' if (mdatp_check.stdout | default('') | trim) == 'active' else 'Not Running' }}"
+
+    - name: Check domain/LDAP join status via realm
+      ansible.builtin.shell: |
+        set -o pipefail
+        realm list 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: realm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set LDAP/realm join status result
+      ansible.builtin.set_fact:
+        realm_status: >-
+          {{ 'Joined' if ((realm_check.stdout | default('') | trim | length) > 0) else 'Not Joined' }}
+
+    - name: Build server_report entry for this host
+      ansible.builtin.set_fact:
+        server_report:
+          - hostname: "{{ host_info.hostname }}"
+            ip: "{{ host_info.ip_address }}"
+            os: "{{ host_info.os_version }}"
+            kernel: "{{ host_info.kernel_version }}"
+            vcpus: "{{ ansible_processor_vcpus | default(ansible_processor_cores | default('N/A')) }}"
+            total_memory_mb: "{{ ansible_memtotal_mb | default('N/A') }}"
+            mounts: "{{ ansible_mounts | default([]) }}"
+            uptime: "{{ uptime_days }} day(s)"
+            mdatp: "{{ mdatp_status }}"
+            realm: "{{ realm_status }}"
+
