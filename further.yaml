@@ -1,15 +1,3 @@
----
-# ============================================================================
-# Compliance Check Playbook
-# Re-implements: cra_status, sat_status, sys_status, gim_status
-# Produces a single HTML compliance report per host (and optionally a
-# combined fleet-wide report on the control node).
-# ============================================================================
-- name: Server compliance checks (crash dump, satellite, syslog, guardium)
-  hosts: all
-  become: true
-  gather_facts: true
-
   vars:
     crash_memory_threshold_gb: 32
     satellite_host: "meylvrhsa01.corp.du.ae"
@@ -18,16 +6,16 @@
     syslog_message_file: "/var/log/messages"      # override per-OS in host_vars if needed
     report_dir_remote: "/tmp/compliance_report"
     report_dir_local: "./compliance_reports"
-
+ 
   tasks:
-
+ 
     # ------------------------------------------------------------------
     # 1. Crash dump check
     # ------------------------------------------------------------------
     - name: Get total memory in GB
       ansible.builtin.set_fact:
         total_mem_gb: "{{ (ansible_memtotal_mb / 1024) | round(0, 'floor') | int }}"
-
+ 
     - name: Check for a crash mountpoint
       ansible.builtin.shell: |
         set -o pipefail
@@ -37,7 +25,7 @@
       register: crash_mount_check
       changed_when: false
       failed_when: false
-
+ 
     - name: Evaluate crash dump compliance
       ansible.builtin.set_fact:
         cra_control: "Crash dump configured with enough space and to be configured as separate file system if memory >= 32GB"
@@ -57,7 +45,7 @@
           {%- else -%}
           No crash mountpoint found and Total Memory ({{ total_mem_gb }}GB) exceeds {{ crash_memory_threshold_gb }} GB
           {%- endif -%}
-
+ 
     # ------------------------------------------------------------------
     # 2. Satellite communication check
     # ------------------------------------------------------------------
@@ -69,13 +57,13 @@
         state: started
       register: sat_check
       failed_when: false
-
+ 
     - name: Evaluate satellite compliance
       ansible.builtin.set_fact:
         sat_control: "Ensure satellite communication should be enabled"
         sat_status: "{{ 'Compliant' if sat_check.state is defined and sat_check.state == 'started' else 'Not Compliant' }}"
         sat_detail: "{{ satellite_host }}:{{ satellite_port }} {{ 'reachable' if sat_check.state is defined and sat_check.state == 'started' else 'unreachable' }}"
-
+ 
     # ------------------------------------------------------------------
     # 3. Syslog integration check
     # ------------------------------------------------------------------
@@ -84,12 +72,12 @@
         name: rsyslog
       register: rsyslog_service
       failed_when: false
-
+ 
     - name: Check syslog message file has content
       ansible.builtin.stat:
         path: "{{ syslog_message_file }}"
       register: syslog_file_stat
-
+ 
     - name: Evaluate syslog compliance
       ansible.builtin.set_fact:
         sys_control: "Syslog integration and confirmation by TSRM"
@@ -103,7 +91,7 @@
           rsyslog active: {{ rsyslog_service.status.ActiveState | default('unknown') }},
           {{ syslog_message_file }} exists: {{ syslog_file_stat.stat.exists | default(false) }},
           size: {{ syslog_file_stat.stat.size | default(0) }} bytes
-
+ 
     # ------------------------------------------------------------------
     # 4. Guardium agent (GIM) check
     # ------------------------------------------------------------------
@@ -112,7 +100,7 @@
       register: oracle_user_check
       changed_when: false
       failed_when: false
-
+ 
     - name: Check for running GIM process
       ansible.builtin.shell: |
         set -o pipefail
@@ -122,7 +110,7 @@
       register: gim_process_check
       changed_when: false
       failed_when: false
-
+ 
     - name: Check for running Oracle PMON process
       ansible.builtin.shell: |
         set -o pipefail
@@ -132,7 +120,7 @@
       register: pmon_process_check
       changed_when: false
       failed_when: false
-
+ 
     - name: Evaluate Guardium compliance
       ansible.builtin.set_fact:
         gim_control: "Guardium Agent installation and confirmation by TSRM"
@@ -152,7 +140,53 @@
           {%- else -%}
           Please secure ISRM approval for Guardium Installation
           {%- endif -%}
-
+ 
+    # ------------------------------------------------------------------
+    # 5. HPOM monitoring agent check
+    # ------------------------------------------------------------------
+    - name: Check for running HPOM (OV) agent process
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -ef | grep '[O]V'
+      args:
+        executable: /bin/bash
+      register: hpom_process_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Evaluate HPOM compliance
+      ansible.builtin.set_fact:
+        hpom_control: "HPOM Monitoring agents"
+        hpom_status: "{{ 'Compliant' if hpom_process_check.rc == 0 else 'Not Compliant' }}"
+        hpom_detail: >-
+          {%- if hpom_process_check.rc == 0 -%}
+          HPOM (OV) agent process running
+          {%- else -%}
+          Please secure approval and contact IT monitoring team to install agent
+          {%- endif -%}
+ 
+    # ------------------------------------------------------------------
+    # 6. SAR utility check
+    # ------------------------------------------------------------------
+    - name: Check sar utility is installed and runnable
+      ansible.builtin.command: sar
+      register: sar_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Evaluate SAR compliance
+      ansible.builtin.set_fact:
+        sar_control: "Sar utility to be installed and configured"
+        sar_ctrl_status: "{{ 'Compliant' if sar_check.rc == 0 else 'Not Compliant' }}"
+        sar_detail: >-
+          {%- if sar_check.rc == 0 -%}
+          sar responded successfully
+          {%- elif sar_check.rc is defined and sar_check.msg is defined and 'not found' in (sar_check.msg | default('')) -%}
+          sar command not found - sysstat package likely not installed
+          {%- else -%}
+          sar returned non-zero exit code ({{ sar_check.rc | default('n/a') }}) - check sysstat service/config
+          {%- endif -%}
+ 
     # ------------------------------------------------------------------
     # Assemble per-host results and render HTML report
     # ------------------------------------------------------------------
@@ -171,44 +205,10 @@
           - control: "{{ gim_control }}"
             status: "{{ gim_status | trim }}"
             detail: "{{ gim_detail | trim }}"
-
-    - name: Ensure remote report directory exists
-      ansible.builtin.file:
-        path: "{{ report_dir_remote }}"
-        state: directory
-        mode: "0755"
-
-    - name: Render per-host HTML compliance report
-      ansible.builtin.template:
-        src: templates/compliance_report.html.j2
-        dest: "{{ report_dir_remote }}/{{ inventory_hostname }}_compliance.html"
-        mode: "0644"
-
-    - name: Fetch report back to control node
-      ansible.builtin.fetch:
-        src: "{{ report_dir_remote }}/{{ inventory_hostname }}_compliance.html"
-        dest: "{{ report_dir_local }}/{{ inventory_hostname }}_compliance.html"
-        flat: true
-
-    - name: Show summary on screen
-      ansible.builtin.debug:
-        msg: "{{ inventory_hostname }}: {{ item.control }} -> {{ item.status }}"
-      loop: "{{ compliance_results }}"
-      loop_control:
-        label: "{{ item.control }}"
-
-# ============================================================================
-# Optional: build one combined fleet-wide HTML report on the control node
-# ============================================================================
-- name: Build combined fleet compliance report
-  hosts: localhost
-  connection: local
-  gather_facts: false
-  vars:
-    report_dir_local: "./compliance_reports"
-  tasks:
-    - name: Render combined report
-      ansible.builtin.template:
-        src: templates/compliance_report_all.html.j2
-        dest: "{{ report_dir_local }}/all_hosts_compliance.html"
-        mode: "0644"
+          - control: "{{ hpom_control }}"
+            status: "{{ hpom_status | trim }}"
+            detail: "{{ hpom_detail | trim }}"
+          - control: "{{ sar_control }}"
+            status: "{{ sar_ctrl_status | trim }}"
+            detail: "{{ sar_detail | trim }}"
+ 
