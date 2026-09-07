@@ -230,6 +230,48 @@
           {%- else -%}
           Symantec is deprecated. Please install the Microsoft Defender
           {%- endif -%}
+    # ------------------------------------------------------------------
+    # 8. EDR check (HIDS/Fidelis and Trellix deprecation confirmation)
+    # ------------------------------------------------------------------
+    - name: Check for Fidelis (endpoint.service) unit file
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-unit-files | grep -q '^endpoint.service'
+      args:
+        executable: /bin/bash
+      register: fidelis_unit_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Check for Trellix (xagt) unit file
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-unit-files | grep -q 'xagt'
+      args:
+        executable: /bin/bash
+      register: trellix_unit_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Evaluate EDR deprecation compliance
+      ansible.builtin.set_fact:
+        edr_control: "HIDS/Fidelis and Trellix has been deprecated confirmation"
+        edr_status: >-
+          {%- if fidelis_unit_check.rc != 0 and trellix_unit_check.rc != 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        edr_detail: >-
+          {%- if fidelis_unit_check.rc != 0 and trellix_unit_check.rc != 0 -%}
+          Fidelis and Trellix has been deprecated.
+          {%- elif fidelis_unit_check.rc != 0 and trellix_unit_check.rc == 0 -%}
+          Trellix (xagt) unit still present - Fidelis is deprecated.
+          {%- elif fidelis_unit_check.rc == 0 and trellix_unit_check.rc != 0 -%}
+          Fidelis (endpoint.service) unit still present.
+          {%- else -%}
+          Fidelis (endpoint.service) and Trellix (xagt) units still present.
+          {%- endif -%}
 
     # ------------------------------------------------------------------
     # Assemble per-host results and render HTML report
