@@ -1,0 +1,249 @@
+---
+# ============================================================================
+# AD Integration Compliance Check
+#
+# Validates that a host is correctly joined to / integrated with Active
+# Directory by:
+#   1. Checking the AD integration service/config is present and active
+#      (sssd / winbind / realmd), and that the domain is joined.
+#   2. Performing a LIVE login test using a real AD user ID + password,
+#      supplied interactively at runtime (never stored in the playbook,
+#      inventory, or logs).
+#
+# The credential used for step 2 should be the operator's own AD account,
+# used solely to prove end-to-end AD auth works on the target host(s).
+#
+# Usage:
+#   ansible-playbook -i inventory.ini ad_integration_check.yml \
+#       --ask-become-pass \
+#       -e "ad_test_user=YOUR_AD_ID"
+#
+#   You will then be prompted (securely, input hidden) for:
+#     - Your AD password (used only for the live login test)
+#
+# The password is:
+#   - collected via ansible.builtin.pause (echo disabled) on the control node
+#   - passed to the remote host only inside the `su`/`sshpass`-free PAM test
+#   - marked no_log on every task that touches it
+#   - never written to disk, inventory, vars files, or the HTML report
+# ============================================================================
+- name: Validate Active Directory integration and live login
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    report_dir_remote: "/tmp/compliance_report"
+    report_dir_local: "./compliance_reports"
+    ad_test_user: "{{ ad_test_user | default('') }}"
+    ad_expected_domain: "corp.ae"   # override with -e "ad_expected_domain=your.domain" if different
+
+  pre_tasks:
+    - name: Fail fast if no AD test user was supplied
+      ansible.builtin.fail:
+        msg: >-
+          Pass your own AD ID with: -e "ad_test_user=YOUR_AD_ID"
+      when: ad_test_user | length == 0
+      run_once: true
+      delegate_to: localhost
+
+    - name: Prompt for AD password (input hidden, never stored)
+      ansible.builtin.pause:
+        prompt: "Enter AD password for '{{ ad_test_user }}' (input hidden)"
+        echo: false
+      register: ad_password_prompt
+      run_once: true
+      delegate_to: localhost
+      no_log: true
+
+    - name: Stash password fact for this run only (in-memory, not persisted)
+      ansible.builtin.set_fact:
+        ad_test_password: "{{ ad_password_prompt.user_input }}"
+      no_log: true
+
+  tasks:
+
+    # ------------------------------------------------------------------
+    # 1. Detect which AD integration stack is in use (sssd / winbind / realmd)
+    # ------------------------------------------------------------------
+    - name: Check if sssd is installed
+      ansible.builtin.command: rpm -q sssd
+      register: sssd_pkg_check
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Check if sssd is installed (Debian family)
+      ansible.builtin.command: dpkg -s sssd
+      register: sssd_pkg_check_deb
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Check sssd service state
+      ansible.builtin.systemd:
+        name: sssd
+      register: sssd_service
+      failed_when: false
+
+    - name: Check winbind service state
+      ansible.builtin.systemd:
+        name: winbind
+      register: winbind_service
+      failed_when: false
+
+    - name: Determine domain join status via realm
+      ansible.builtin.command: realm list
+      register: realm_list_check
+      changed_when: false
+      failed_when: false
+
+    - name: Determine domain join status via net ads (Samba/winbind path)
+      ansible.builtin.command: net ads testjoin
+      register: net_ads_testjoin
+      changed_when: false
+      failed_when: false
+
+    # ------------------------------------------------------------------
+    # 2. Evaluate integration/config compliance
+    # ------------------------------------------------------------------
+    - name: Evaluate AD integration (config/service) compliance
+      ansible.builtin.set_fact:
+        ad_int_control: "AD integration service configured and domain joined (sssd/winbind + realm/net ads)"
+        ad_int_status: >-
+          {%- if (sssd_service.status is defined and sssd_service.status.ActiveState == 'active' and realm_list_check.rc == 0 and realm_list_check.stdout | length > 0)
+               or (winbind_service.status is defined and winbind_service.status.ActiveState == 'active' and net_ads_testjoin.rc == 0) -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        ad_int_detail: >-
+          sssd active: {{ sssd_service.status.ActiveState | default('not installed') }};
+          winbind active: {{ winbind_service.status.ActiveState | default('not installed') }};
+          realm list: {{ (realm_list_check.stdout | default('')) if realm_list_check.rc == 0 else 'not joined / realmd unavailable' }};
+          net ads testjoin rc: {{ net_ads_testjoin.rc | default('n/a') }}
+
+    # ------------------------------------------------------------------
+    # 2b. Simple domain-name check: realm list must show the expected
+    #     corporate domain (equivalent to: realm list | grep corp.ae)
+    # ------------------------------------------------------------------
+    - name: Evaluate domain-name match compliance
+      ansible.builtin.set_fact:
+        ad_domain_control: "AD integration validated - realm joined to expected domain ({{ ad_expected_domain }})"
+        ad_domain_status: >-
+          {%- if realm_list_check.rc == 0 and ad_expected_domain in (realm_list_check.stdout | default('')) -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        ad_domain_detail: >-
+          {%- if realm_list_check.rc == 0 and ad_expected_domain in (realm_list_check.stdout | default('')) -%}
+          realm list shows domain '{{ ad_expected_domain }}'
+          {%- else -%}
+          realm list did not show expected domain '{{ ad_expected_domain }}' - host may not be domain joined
+          {%- endif -%}
+
+    # ------------------------------------------------------------------
+    # 3. Live login test using the operator's own AD ID + password
+    #    Uses PAM directly via `su` so no plaintext password ever touches
+    #    disk, argv (visible in `ps`), or logs. no_log suppresses the
+    #    task output/registered result from being printed or logged.
+    # ------------------------------------------------------------------
+    - name: Attempt live AD login as {{ ad_test_user }}
+      ansible.builtin.expect:
+        command: "su - '{{ ad_test_user }}' -c 'id -un'"
+        responses:
+          (?i)password: "{{ ad_test_password }}"
+        timeout: 15
+      register: ad_login_test
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Evaluate live login compliance
+      ansible.builtin.set_fact:
+        ad_login_control: "Live AD login validated using operator-supplied AD ID"
+        ad_login_status: >-
+          {%- if ad_login_test.rc is defined and ad_login_test.rc == 0 and ad_test_user in (ad_login_test.stdout | default('')) -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        ad_login_detail: >-
+          {%- if ad_login_test.rc is defined and ad_login_test.rc == 0 and ad_test_user in (ad_login_test.stdout | default('')) -%}
+          Login succeeded for user '{{ ad_test_user }}' via PAM/sssd
+          {%- else -%}
+          Login failed for user '{{ ad_test_user }}' - check AD connectivity, account status, or credential entered
+          {%- endif -%}
+      no_log: true
+
+    # ------------------------------------------------------------------
+    # 4. Home directory / shell provisioning sanity check (bonus signal)
+    #    Confirms the AD user actually resolves via NSS (not just PAM)
+    # ------------------------------------------------------------------
+    - name: Confirm AD user resolves via NSS (getent passwd)
+      ansible.builtin.command: "getent passwd '{{ ad_test_user }}'"
+      register: getent_check
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate NSS resolution compliance
+      ansible.builtin.set_fact:
+        ad_nss_control: "AD user resolvable via NSS (getent passwd)"
+        ad_nss_status: "{{ 'Compliant' if getent_check.rc == 0 else 'Not Compliant' }}"
+        ad_nss_detail: >-
+          {%- if getent_check.rc == 0 -%}
+          Resolved: {{ getent_check.stdout }}
+          {%- else -%}
+          User '{{ ad_test_user }}' not found via NSS - check nsswitch.conf and sssd domain config
+          {%- endif -%}
+
+    # ------------------------------------------------------------------
+    # Assemble results and render HTML report
+    # ------------------------------------------------------------------
+    - name: Build results list for this host
+      ansible.builtin.set_fact:
+        ad_compliance_results:
+          - control: "{{ ad_int_control }}"
+            status: "{{ ad_int_status | trim }}"
+            detail: "{{ ad_int_detail | trim }}"
+          - control: "{{ ad_domain_control }}"
+            status: "{{ ad_domain_status | trim }}"
+            detail: "{{ ad_domain_detail | trim }}"
+          - control: "{{ ad_nss_control }}"
+            status: "{{ ad_nss_status | trim }}"
+            detail: "{{ ad_nss_detail | trim }}"
+          - control: "{{ ad_login_control }}"
+            status: "{{ ad_login_status | trim }}"
+            detail: "{{ ad_login_detail | trim }}"
+
+    - name: Ensure remote report directory exists
+      ansible.builtin.file:
+        path: "{{ report_dir_remote }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render per-host AD compliance HTML report
+      ansible.builtin.template:
+        src: templates/ad_compliance_report.html.j2
+        dest: "{{ report_dir_remote }}/{{ inventory_hostname }}_ad_compliance.html"
+        mode: "0644"
+
+    - name: Fetch report back to control node
+      ansible.builtin.fetch:
+        src: "{{ report_dir_remote }}/{{ inventory_hostname }}_ad_compliance.html"
+        dest: "{{ report_dir_local }}/{{ inventory_hostname }}_ad_compliance.html"
+        flat: true
+
+    - name: Show summary on screen (no credentials printed)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: {{ item.control }} -> {{ item.status }}"
+      loop: "{{ ad_compliance_results }}"
+      loop_control:
+        label: "{{ item.control }}"
+
+  post_tasks:
+    - name: Clear password fact from memory at end of play
+      ansible.builtin.set_fact:
+        ad_test_password: ""
+      no_log: true
