@@ -1,0 +1,10 @@
+S.NO	Action	Status	Comment	Column1
+1	"DCR Validation for Total Namespace resource allocation and quota
+(Infra team will be validating for entire project only not on individual pod/deployment as  this will be keep changing based on application design)"	Complaint		applicable
+2	Backup Strategy to be aligned with back up team and ensure name space ,statefull,stateless configuraitons are  backed up	Complaint		applicable
+3	Resource Quota to be enabled with resource restriction.	Enabled		applicable
+5	Egress details for application to be shared	10.0.0.3		applicable
+6	Storage Details to be shared	prodstorageclass   block.csi.ibm.com		applicable
+7	Node Labels/selectors  to be ensured for each project	CCC=use		applicable
+12	Namespace admin and namespace view roles to be defined for each project (Project admin have full provilge on project resource)	Complaint		applicable
+18	Application should not be depending on infra ELK cluster	Complaint		applicable
