@@ -1,10 +1,342 @@
-S.NO	Action	Status	Comment	Column1
-1	"DCR Validation for Total Namespace resource allocation and quota
-(Infra team will be validating for entire project only not on individual pod/deployment as  this will be keep changing based on application design)"	Complaint		applicable
-2	Backup Strategy to be aligned with back up team and ensure name space ,statefull,stateless configuraitons are  backed up	Complaint		applicable
-3	Resource Quota to be enabled with resource restriction.	Enabled		applicable
-5	Egress details for application to be shared	10.0.0.3		applicable
-6	Storage Details to be shared	prodstorageclass   block.csi.ibm.com		applicable
-7	Node Labels/selectors  to be ensured for each project	CCC=use		applicable
-12	Namespace admin and namespace view roles to be defined for each project (Project admin have full provilge on project resource)	Complaint		applicable
-18	Application should not be depending on infra ELK cluster	Complaint		applicable
+#!/usr/bin/env bash
+#
+# fetch-namespace-dcr-details.sh
+#
+# Fetches live details for a given namespace/project and builds the DCR
+# validation checklist with:
+#   - Status  : "Complaint"     if details were found
+#               "Non Complaint" if nothing was found / not configured
+#   - Comment : the actual fetched detail (or blank if none)
+#
+# Works with both `oc` (OpenShift) and `kubectl` (plain Kubernetes) -
+# uses whichever is available, preferring `oc`.
+#
+# Usage:
+#   ./fetch-namespace-dcr-details.sh -n <namespace> [-o output.html]
+#
+# Example:
+#   ./fetch-namespace-dcr-details.sh -n ccairtime -o ccairtime-dcr.html
+
+set -uo pipefail
+
+NAMESPACE=""
+OUTPUT_FILE=""
+CLI=""
+
+usage() {
+    cat <<EOF
+Usage: $0 -n <namespace> [-o output.html]
+
+Options:
+  -n   Namespace/project to inspect (required)
+  -o   Output HTML file (optional; default: <namespace>-dcr-report.html)
+  -h   Show this help message
+EOF
+    exit 1
+}
+
+while getopts "n:o:h" opt; do
+    case "$opt" in
+        n) NAMESPACE="$OPTARG" ;;
+        o) OUTPUT_FILE="$OPTARG" ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+if [[ -z "$NAMESPACE" ]]; then
+    echo "Error: namespace (-n) is required." >&2
+    usage
+fi
+
+OUTPUT_FILE="${OUTPUT_FILE:-${NAMESPACE}-dcr-report.html}"
+
+# ------------------------------
+# Detect CLI (oc preferred, fallback kubectl)
+# ------------------------------
+detect_cli() {
+    if command -v oc &>/dev/null; then
+        CLI="oc"
+    elif command -v kubectl &>/dev/null; then
+        CLI="kubectl"
+    else
+        echo "Error: neither 'oc' nor 'kubectl' found in PATH." >&2
+        exit 1
+    fi
+
+    if ! $CLI get ns "$NAMESPACE" &>/dev/null; then
+        echo "Error: namespace '$NAMESPACE' not found or not accessible." >&2
+        exit 1
+    fi
+}
+
+# ------------------------------
+# Each getter prints ONLY the comment text.
+# Empty output = "not found" -> Status becomes "Non Complaint".
+# ------------------------------
+
+get_resource_quota() {
+    local out
+    out=$($CLI get resourcequota -n "$NAMESPACE" --no-headers 2>/dev/null)
+    [[ -z "$out" ]] && return
+
+    local names detail
+    names=$(echo "$out" | awk '{print $1}' | paste -sd ', ' -)
+    detail=$($CLI get resourcequota -n "$NAMESPACE" -o json 2>/dev/null | \
+        python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+parts = []
+for item in d.get("items", []):
+    name = item["metadata"]["name"]
+    hard = item.get("status", {}).get("hard", {})
+    kv = ", ".join(f"{k}={v}" for k, v in hard.items())
+    parts.append(f"{name}: {kv}")
+print(" | ".join(parts))
+' 2>/dev/null)
+
+    if [[ -n "$detail" ]]; then
+        echo "${detail}"
+    else
+        echo "${names}"
+    fi
+}
+
+get_egress_details() {
+    if [[ "$CLI" != "oc" ]]; then
+        return
+    fi
+
+    local out
+    out=$(oc get egressip -o json 2>/dev/null | \
+        python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+ns='${NAMESPACE}'
+found = []
+for item in d.get('items', []):
+    sel = item.get('spec', {}).get('namespaceSelector', {}).get('matchLabels', {})
+    if sel.get('name') == ns:
+        ips = item.get('spec', {}).get('egressIPs', [])
+        found.append(', '.join(ips))
+print(' | '.join(found))
+" 2>/dev/null)
+
+    if [[ -n "$out" ]]; then
+        echo "$out"
+        return
+    fi
+
+    # Fallback: older OpenShift SDN netnamespace egress IPs
+    local netns_egress
+    netns_egress=$(oc get netnamespace "$NAMESPACE" -o jsonpath='{.egressIPs}' 2>/dev/null)
+    if [[ -n "$netns_egress" && "$netns_egress" != "[]" ]]; then
+        echo "$netns_egress"
+    fi
+}
+
+get_storage_details() {
+    local scs pvcs result
+
+    scs=$($CLI get storageclass -o custom-columns=NAME:.metadata.name,PROVISIONER:.provisioner --no-headers 2>/dev/null | \
+        awk '{printf "%s (%s)\n", $1, $2}' | paste -sd '; ' -)
+
+    pvcs=$($CLI get pvc -n "$NAMESPACE" --no-headers 2>/dev/null | \
+        awk '{printf "%s -> %s\n", $1, $6}' | paste -sd '; ' -)
+
+    result=""
+    [[ -n "$scs" ]] && result="${scs}"
+    if [[ -n "$pvcs" ]]; then
+        [[ -n "$result" ]] && result="${result} || PVCs: ${pvcs}" || result="PVCs: ${pvcs}"
+    fi
+    echo "$result"
+}
+
+get_node_labels() {
+    local ns_selector
+    ns_selector=$($CLI get ns "$NAMESPACE" -o jsonpath='{.metadata.annotations.openshift\.io/node-selector}' 2>/dev/null)
+    [[ -n "$ns_selector" ]] && echo "$ns_selector"
+}
+
+get_role_bindings() {
+    local out
+    out=$($CLI get rolebindings -n "$NAMESPACE" --no-headers 2>/dev/null | \
+        awk '{printf "%s (role=%s)\n", $1, $2}' | paste -sd '; ' -)
+    [[ -n "$out" ]] && echo "$out"
+}
+
+get_elk_dependency() {
+    # Best-effort check: look for infra ELK-related env vars / configmaps referenced
+    # in workloads within the namespace. Non-exhaustive — flag for manual review.
+    local hits
+    hits=$($CLI get deployment,statefulset,daemonset -n "$NAMESPACE" -o json 2>/dev/null | \
+        grep -io 'elk\|elasticsearch\|logstash\|kibana' | sort -u | paste -sd ', ' -)
+    [[ -n "$hits" ]] && echo "Possible ELK reference(s) found: ${hits}"
+}
+
+# ------------------------------
+# Build checklist: id|Action|Comment
+# Status is derived: Comment non-empty -> Complaint, else Non Complaint
+# ------------------------------
+declare -A COMMENTS
+
+collect_data() {
+    echo "Fetching details for namespace '$NAMESPACE' using '$CLI'..." >&2
+    COMMENTS["quota"]="$(get_resource_quota)"
+    COMMENTS["egress"]="$(get_egress_details)"
+    COMMENTS["storage"]="$(get_storage_details)"
+    COMMENTS["nodes"]="$(get_node_labels)"
+    COMMENTS["roles"]="$(get_role_bindings)"
+    COMMENTS["elk"]="$(get_elk_dependency)"
+}
+
+status_for() {
+    local val="$1"
+    if [[ -n "$val" ]]; then
+        echo "Complaint"
+    else
+        echo "Non Complaint"
+    fi
+}
+
+# ------------------------------
+# Console output
+# ------------------------------
+print_console_report() {
+    local sno action comment status
+    echo
+    echo "================================================================================================"
+    echo " DCR Validation Details - Namespace: $NAMESPACE"
+    echo "================================================================================================"
+    printf "%-4s %-55s %-15s %s\n" "S.No" "Action" "Status" "Comment"
+    printf '%s\n' "------------------------------------------------------------------------------------------------"
+
+    local rows=(
+        "3|Resource Quota to be enabled with resource restriction.|${COMMENTS[quota]}"
+        "5|Egress details for application to be shared|${COMMENTS[egress]}"
+        "6|Storage Details to be shared|${COMMENTS[storage]}"
+        "7|Node Labels/selectors to be ensured for each project|${COMMENTS[nodes]}"
+        "12|Namespace admin and namespace view roles to be defined for each project|${COMMENTS[roles]}"
+        "18|Application should not be depending on infra ELK cluster|${COMMENTS[elk]}"
+    )
+
+    for row in "${rows[@]}"; do
+        IFS='|' read -r sno action comment <<< "$row"
+        status=$(status_for "$comment")
+        printf "%-4s %-55s %-15s %s\n" "$sno" "$action" "$status" "$comment"
+    done
+    echo "================================================================================================"
+}
+
+# ------------------------------
+# HTML output
+# ------------------------------
+html_escape() {
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+build_html_rows() {
+    local sno action comment status status_class row_html=""
+
+    local rows=(
+        "3|Resource Quota to be enabled with resource restriction.|${COMMENTS[quota]}"
+        "5|Egress details for application to be shared|${COMMENTS[egress]}"
+        "6|Storage Details to be shared|${COMMENTS[storage]}"
+        "7|Node Labels/selectors  to be ensured for each project|${COMMENTS[nodes]}"
+        "12|Namespace admin and namespace view roles to be defined for each project (Project admin have full provilge on project resource)|${COMMENTS[roles]}"
+        "18|Application should not be depending on infra ELK cluster|${COMMENTS[elk]}"
+    )
+
+    for row in "${rows[@]}"; do
+        IFS='|' read -r sno action comment <<< "$row"
+        status=$(status_for "$comment")
+        if [[ "$status" == "Complaint" ]]; then
+            status_class="complaint"
+        else
+            status_class="non-complaint"
+        fi
+        local action_esc comment_esc
+        action_esc=$(echo "$action" | html_escape)
+        comment_esc=$(echo "$comment" | html_escape)
+
+        row_html+="        <tr>
+          <td class=\"sno\">${sno}</td>
+          <td class=\"action\">${action_esc}</td>
+          <td class=\"status ${status_class}\">${status}</td>
+          <td class=\"comment\">${comment_esc}</td>
+          <td class=\"col1\">applicable</td>
+        </tr>
+"
+    done
+    echo "$row_html"
+}
+
+generate_html_report() {
+    local rows_html
+    rows_html="$(build_html_rows)"
+
+    cat <<EOF > "$OUTPUT_FILE"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>DCR Validation Report - ${NAMESPACE}</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; margin: 20px; background: #f5f5f5; }
+  h2 { margin-bottom: 4px; }
+  p.meta { margin-top: 0; color: #555; font-size: 13px; }
+  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.15); }
+  th, td { border: 1px solid #444; padding: 8px 10px; vertical-align: top; font-size: 13px; word-break: break-word; }
+  thead th { background: #000; color: #fff; text-align: center; }
+  td.sno { text-align: center; width: 4%; }
+  td.action { width: 38%; }
+  td.status { width: 12%; font-weight: bold; text-align: center; }
+  td.status.complaint { color: #1a73e8; }
+  td.status.non-complaint { color: #d93025; }
+  td.comment { width: 34%; color: #1a4d80; }
+  td.col1 { background: #1e9e50; color: #fff; text-align: center; font-weight: bold; width: 12%; }
+  tr:nth-child(even) { background: #fafafa; }
+</style>
+</head>
+<body>
+
+<h2>DCR Validation for Total Namespace Resource Allocation and Quota</h2>
+<p class="meta">Namespace: <strong>${NAMESPACE}</strong> &nbsp;|&nbsp; Generated: $(date '+%Y-%m-%d %H:%M:%S %Z')</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>S.NO</th>
+      <th>Action</th>
+      <th>Status</th>
+      <th>Comment</th>
+      <th>Column1</th>
+    </tr>
+  </thead>
+  <tbody>
+${rows_html}  </tbody>
+</table>
+
+</body>
+</html>
+EOF
+    echo "HTML report generated: $OUTPUT_FILE"
+}
+
+# ------------------------------
+# Main
+# ------------------------------
+main() {
+    detect_cli
+    collect_data
+    print_console_report
+    generate_html_report
+}
+
+main
