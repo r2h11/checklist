@@ -198,7 +198,20 @@ get_storage_details() {
 
 get_node_labels() {
     local ns="$1"
-    $CLI get ns "$ns" -o jsonpath='{.metadata.annotations.openshift\.io/node-selector}' 2>/dev/null
+    local labels
+    # Parse `oc describe nodes` / `kubectl describe nodes` output, pulling out
+    # only the "key=use" label tokens (works whether the line is prefixed with
+    # "labels:" or "Labels:" and regardless of leading whitespace/indentation).
+    # Deduplicated so repeated labels across multiple worker nodes collapse
+    # into a single entry.
+    labels=$($CLI describe nodes 2>/dev/null | \
+        grep -oiE '[A-Za-z0-9_.\/-]+=use' | \
+        sort -u)
+    [[ -z "$labels" ]] && return
+    # Join with ", " - `paste -sd ', '` is unsafe here since paste treats a
+    # multi-character -d argument as a cycling set of single-char delimiters
+    # (e.g. three items would come out "a=use,b=use c=use"), so join manually.
+    echo "$labels" | paste -sd',' - | sed 's/,/, /g'
 }
 
 get_role_bindings() {
