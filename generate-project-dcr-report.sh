@@ -213,6 +213,22 @@ get_elk_dependency() {
         grep -io 'elk\|elasticsearch\|logstash\|kibana' | sort -u | paste -sd ', ' -
 }
 
+# ELK check has INVERTED logic vs. the other checks: finding a dependency
+# means NON-COMPLIANT, finding nothing means COMPLIANT.
+status_for_elk() {
+    local hits="$1"
+    [[ -z "$hits" ]] && echo "Complaint" || echo "Non Complaint"
+}
+
+comment_for_elk() {
+    local hits="$1"
+    if [[ -z "$hits" ]]; then
+        echo "No dependency on infra ELK/Elasticsearch cluster found"
+    else
+        echo "Dependency found on: ${hits}"
+    fi
+}
+
 status_for() {
     [[ -n "$1" ]] && echo "Complaint" || echo "Non Complaint"
 }
@@ -261,19 +277,36 @@ print_console_report() {
         echo "===================================================================================="
         printf "%-4s %-55s %-15s %s\n" "S.No" "Action" "Status" "Comment"
         printf '%s\n' "------------------------------------------------------------------------------------------------"
+
+        # Static rows: always "Complaint", no fetch/validation performed.
+        local static_rows=(
+            "1|\"DCR Validation for Total Namespace resource allocation and quota (Infra team will be validating entire project only not on individual pod/deployment as this will be keep changing based on application design)\"|Complaint|"
+            "2|Backup Strategy to be aligned with back up team and ensure name space ,stateful,stateless configuraitons are  backed up|Complaint|Backup is available it will configured once application pod is deployed"
+        )
+        for row in "${static_rows[@]}"; do
+            IFS='|' read -r sno action status comment <<< "$row"
+            printf "%-4s %-55s %-15s %s\n" "$sno" "$action" "$status" "$comment"
+        done
+
         local rows=(
             "3|Resource Quota to be enabled with resource restriction.|${NS_COMMENTS[${ns}::quota]}"
             "5|Egress details for application to be shared|${NS_COMMENTS[${ns}::egress]}"
             "6|Storage Details to be shared|${NS_COMMENTS[${ns}::storage]}"
             "7|Node Labels/selectors to be ensured for each project|${NS_COMMENTS[${ns}::nodes]}"
             "12|Namespace admin and namespace view roles to be defined for each project|${NS_COMMENTS[${ns}::roles]}"
-            "18|Application should not be depending on infra ELK cluster|${NS_COMMENTS[${ns}::elk]}"
         )
         for row in "${rows[@]}"; do
             IFS='|' read -r sno action comment <<< "$row"
             status=$(status_for "$comment")
             printf "%-4s %-55s %-15s %s\n" "$sno" "$action" "$status" "$comment"
         done
+
+        # Row 18 (ELK) uses inverted logic: no dependency found = Complaint.
+        local elk_hits="${NS_COMMENTS[${ns}::elk]}"
+        local elk_status elk_comment
+        elk_status=$(status_for_elk "$elk_hits")
+        elk_comment=$(comment_for_elk "$elk_hits")
+        printf "%-4s %-55s %-15s %s\n" "18" "Application should not be depending on infra ELK cluster" "$elk_status" "$elk_comment"
     done
     echo "===================================================================================="
 }
@@ -289,13 +322,32 @@ html_escape() {
 build_dcr_html_rows_for_ns() {
     local ns="$1"
     local sno action comment status status_class row_html=""
+
+    # Static rows: always "Complaint", no fetch/validation performed.
+    # These are informational/process items, not something the cluster
+    # can confirm or deny, so they render fixed on every run.
+    local static_rows=(
+        "1|\"DCR Validation for Total Namespace resource allocation and quota (Infra team will be validating entire project only not on individual pod/deployment as this will be keep changing based on application design)\"|Complaint|"
+        "2|Backup Strategy to be aligned with back up team and ensure name space ,stateful,stateless configuraitons are  backed up|Complaint|Backup is available it will configured once application pod is deployed"
+    )
+    for row in "${static_rows[@]}"; do
+        IFS='|' read -r sno action status comment <<< "$row"
+        row_html+="        <tr>
+          <td class=\"sno\">${sno}</td>
+          <td class=\"action\">$(echo "$action" | html_escape)</td>
+          <td class=\"status complaint\">${status}</td>
+          <td class=\"comment\">$(echo "$comment" | html_escape)</td>
+          <td class=\"col1\">applicable</td>
+        </tr>
+"
+    done
+
     local rows=(
         "3|Resource Quota to be enabled with resource restriction.|${NS_COMMENTS[${ns}::quota]}"
         "5|Egress details for application to be shared|${NS_COMMENTS[${ns}::egress]}"
         "6|Storage Details to be shared|${NS_COMMENTS[${ns}::storage]}"
         "7|Node Labels/selectors  to be ensured for each project|${NS_COMMENTS[${ns}::nodes]}"
         "12|Namespace admin and namespace view roles to be defined for each project (Project admin have full provilge on project resource)|${NS_COMMENTS[${ns}::roles]}"
-        "18|Application should not be depending on infra ELK cluster|${NS_COMMENTS[${ns}::elk]}"
     )
     for row in "${rows[@]}"; do
         IFS='|' read -r sno action comment <<< "$row"
@@ -310,6 +362,22 @@ build_dcr_html_rows_for_ns() {
         </tr>
 "
     done
+
+    # Row 18 (ELK) uses inverted logic: no dependency found = Complaint.
+    local elk_hits="${NS_COMMENTS[${ns}::elk]}"
+    local elk_status elk_comment elk_class
+    elk_status=$(status_for_elk "$elk_hits")
+    elk_comment=$(comment_for_elk "$elk_hits")
+    [[ "$elk_status" == "Complaint" ]] && elk_class="complaint" || elk_class="non-complaint"
+    row_html+="        <tr>
+          <td class=\"sno\">18</td>
+          <td class=\"action\">Application should not be depending on infra ELK cluster</td>
+          <td class=\"status ${elk_class}\">${elk_status}</td>
+          <td class=\"comment\">$(echo "$elk_comment" | html_escape)</td>
+          <td class=\"col1\">applicable</td>
+        </tr>
+"
+
     echo "$row_html"
 }
 
