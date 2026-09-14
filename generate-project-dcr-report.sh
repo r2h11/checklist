@@ -111,6 +111,22 @@ detect_cli() {
     fi
 }
 
+OC_API_URL=""
+OC_CONSOLE_URL=""
+
+detect_cluster_urls() {
+    if [[ "$CLI" == "oc" ]]; then
+        OC_API_URL=$(oc whoami --show-server 2>/dev/null)
+        OC_CONSOLE_URL=$(oc whoami --show-console 2>/dev/null)
+    else
+        # kubectl fallback: API URL is derivable, console URL generally is not.
+        OC_API_URL=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)
+        OC_CONSOLE_URL=""
+    fi
+    [[ -z "$OC_API_URL" ]] && OC_API_URL="Not available"
+    [[ -z "$OC_CONSOLE_URL" ]] && OC_CONSOLE_URL="Not available"
+}
+
 validate_namespaces() {
     local ns valid=()
     for ns in "${NAMESPACES[@]}"; do
@@ -280,6 +296,8 @@ print_console_report() {
     echo "Jira No         : $JIRA_NO"
     echo "Archer ID Demand: $ARCHER_ID"
     echo "Environment     : $ENVIRONMENT"
+    echo "OC API URL      : $OC_API_URL"
+    echo "OC Console URL  : $OC_CONSOLE_URL"
     echo "Namespaces      : ${NAMESPACES[*]}"
 
     local ns sno action comment status
@@ -330,6 +348,16 @@ print_console_report() {
 
 html_escape() {
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+build_url_cell() {
+    local url="$1" esc
+    esc=$(echo "$url" | html_escape)
+    if [[ "$url" == http* ]]; then
+        echo "<a href=\"${esc}\" target=\"_blank\">${esc}</a>"
+    else
+        echo "$esc"
+    fi
 }
 
 build_dcr_html_rows_for_ns() {
@@ -566,6 +594,12 @@ generate_html_report() {
                 <td class="label">Environment</td>
                 <td class="value">$(echo "$ENVIRONMENT" | html_escape)</td>
             </tr>
+            <tr>
+                <td class="label">OC API URL</td>
+                <td class="value">$(build_url_cell "$OC_API_URL")</td>
+                <td class="label">OC Console URL</td>
+                <td class="value">$(build_url_cell "$OC_CONSOLE_URL")</td>
+            </tr>
         </table>
 
         <div class="toc">
@@ -593,6 +627,7 @@ EOF
 
 main() {
     detect_cli
+    detect_cluster_urls
     validate_namespaces
     collect_all_dcr_data
     print_console_report
