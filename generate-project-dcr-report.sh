@@ -595,9 +595,9 @@ generate_html_report() {
                 <td class="value">$(echo "$ENVIRONMENT" | html_escape)</td>
             </tr>
             <tr>
-                <td class="label">OC API URL</td>
+                <td class="label">Openshift API URL</td>
                 <td class="value">$(build_url_cell "$OC_API_URL")</td>
-                <td class="label">OC Console URL</td>
+                <td class="label">Openshift Console URL</td>
                 <td class="value">$(build_url_cell "$OC_CONSOLE_URL")</td>
             </tr>
         </table>
