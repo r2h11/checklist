@@ -438,7 +438,7 @@ build_all_dcr_sections() {
         anchor=$(echo "$ns" | tr -c 'a-zA-Z0-9' '-')
         rows_html="$(build_dcr_html_rows_for_ns "$ns")"
         html+="    <div class=\"section\">
-        <div class=\"section-title\" id=\"ns-${anchor}\">DCR Validation &mdash; Namespace: $(echo "$ns" | html_escape)</div>
+        <div class=\"section-title\" id=\"ns-${anchor}\">Checklist Validation &mdash; Namespace: $(echo "$ns" | html_escape)</div>
         <table>
           <thead>
             <tr>
@@ -464,7 +464,7 @@ generate_html_report() {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>DCR Validation Report - ${PROJECT_NAME}</title>
+<title>Checklist Validation Report - ${PROJECT_NAME}</title>
 <style>
     body {
         font-family: Arial, sans-serif;
@@ -586,7 +586,7 @@ generate_html_report() {
                 <td class="label">Project Name</td>
                 <td class="value">$(echo "$PROJECT_NAME" | html_escape)</td>
                 <td class="label">Jira No</td>
-                <td class="value">$(echo "$JIRA_NO" | html_escape)</td>
+                <td class="value">$(build_url_cell "https://jira-datacenter.du.ae/browse/$JIRA_NO")</td>
             </tr>
             <tr>
                 <td class="label">Archer ID Demand</td>
