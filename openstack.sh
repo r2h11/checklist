@@ -2,11 +2,12 @@
 #
 # openstack_validation_checklist.sh
 # ---------------------------------
-# Builds a validation checklist PER INSTANCE for an OpenStack (OSP) project.
-# Each instance gets its own HTML checklist containing both sections:
+# Builds ONE HTML validation checklist for an OpenStack (OSP) project,
+# covering every instance in it. The file opens with a summary/index table
+# (links jump to each instance's section on the same page), followed by a
+# full checklist per instance:
 #   1. Validation Points          (project + that instance's nova/cinder data)
 #   2. OS Level Validation Points (that instance's in-guest data)
-# An index.html links them all together.
 #
 # Usage : ./openstack_validation_checklist.sh -p <project> [-c <cloud-name>]
 #                                             [-n <cluster-name>] [-o <outdir>]
@@ -87,22 +88,25 @@ jqx() {
 TS=$(date +%Y%m%d_%H%M%S)
 STAMP=$(date '+%Y-%m-%d %H:%M:%S')
 SAFE=$(printf '%s' "$PROJECT" | tr -c 'A-Za-z0-9._-' '_')
-RUNDIR="$OUTDIR/${SAFE}_${TS}"
-mkdir -p "$RUNDIR" || { echo "ERROR: cannot create $RUNDIR" >&2; exit 1; }
+mkdir -p "$OUTDIR" || { echo "ERROR: cannot create $OUTDIR" >&2; exit 1; }
+FILE="$OUTDIR/${SAFE}_validation_${TS}.html"
 NA="Not Available"
 
 esc() { echo "${1:-}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 blank_if_empty() { local v; v=$(cat); [[ -z "${v//[[:space:]]/}" ]] && echo "$NA" || echo "$v"; }
 
 CSS='body{font-family:Calibri,Arial,sans-serif;font-size:12px;margin:18px}
-table{border-collapse:collapse;width:100%;table-layout:fixed}
+table{border-collapse:collapse;width:100%;table-layout:fixed;margin-bottom:26px}
 td,th{border:1px solid #000;padding:3px 5px;vertical-align:top;word-wrap:break-word}
 .sec{background:#F4B183;font-weight:bold;text-align:center}
 .hdr{background:#D9D9D9;font-weight:bold;text-align:center}
 col.c1{width:26%}col.c2{width:32%}col.c3{width:21%}col.c4{width:21%}
-h2{margin:0 0 4px;font-size:16px} .meta{color:#444;margin:0 0 12px}
-a{color:#1155cc}'
+h2{margin:0 0 4px;font-size:16px} h3{margin:26px 0 4px;font-size:14px}
+.meta{color:#444;margin:0 0 12px}
+a{color:#1155cc} .top{font-size:11px}'
 
+# r/banner append to $FILE, which is the single combined report for the
+# whole run -- every section (index + each instance) writes to the same file.
 r() { # r <desc> <result> <remarks> <expected>
   { echo "<tr><td>$(esc "$1")</td><td>$(esc "${2:-$NA}")</td>"
     echo "<td>$(esc "${3:-}")</td><td>$(esc "${4:-}")</td></tr>"; } >> "$FILE"
@@ -165,23 +169,42 @@ os_check() { [[ -z "$SSH_USER" || -z "${1:-}" ]] && { echo ""; return; }
   timeout 15 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
       "${SSH_USER}@${1}" "$2" 2>/dev/null | tr '\n' ' '; }
 
-declare -a INDEX=()
+# ----------------------------------------------------------- file header -----
+{
+  echo "<html><head><meta charset='utf-8'><title>Validation - $(esc "$PROJ_NAME")</title><style>$CSS</style></head><body>"
+  echo "<a id='top'></a><h2>OpenStack Validation Checklist &ndash; $(esc "$PROJ_NAME")</h2>"
+  echo "<p class='meta'>Cluster: $(esc "$CLUSTER") &nbsp;|&nbsp; $PROJ_COUNT &nbsp;|&nbsp; Generated: $STAMP</p>"
+} > "$FILE"
+
+# ------------------------------------------------- summary/index table -------
+# Cheap first pass (no per-instance API calls) so the index can sit at the
+# very top of the file, above every instance's detailed section below it.
+{
+  echo "<table><col class='c1'><col class='c2'><col class='c3'><col class='c4'>"
+  echo "<tr><td class='sec' colspan='4'>Instances</td></tr>"
+  echo "<tr><td class='hdr'>Instance</td><td class='hdr'>Status / IP</td><td class='hdr'>Flavor</td><td class='hdr'>Compute Host</td></tr>"
+  while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
+    [[ -z "$SID" ]] && continue
+    IP=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<<"$SNET" | tail -1)
+    ANCHOR=$(printf '%s' "$SNAME" | tr -c 'A-Za-z0-9._-' '_')
+    echo "<tr><td><a href='#$(esc "$ANCHOR")'>$(esc "$SNAME")</a></td><td>$(esc "$SSTAT") / $(esc "${IP:-$NA}")</td><td>$(esc "$SFLAV")</td><td>$(esc "${SHOST:-$NA}")</td></tr>"
+  done <<<"$SERVERS_TSV"
+  echo "</table>"
+} >> "$FILE"
 
 # ================================ per instance ===============================
 while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   [[ -z "$SID" ]] && continue
   echo "   - $SNAME"
-  FSAFE=$(printf '%s' "$SNAME" | tr -c 'A-Za-z0-9._-' '_')
-  FILE="$RUNDIR/${FSAFE}.html"
+  ANCHOR=$(printf '%s' "$SNAME" | tr -c 'A-Za-z0-9._-' '_')
   DETAIL=$(os server show "$SID" -f json); [[ -z "$DETAIL" ]] && DETAIL='{}'
   IP=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' <<<"$SNET" | tail -1)
 
   {
-    echo "<html><head><meta charset='utf-8'><title>Validation - $(esc "$SNAME")</title><style>$CSS</style></head><body>"
-    echo "<h2>Validation Checklist &ndash; $(esc "$SNAME")</h2>"
-    echo "<p class='meta'>Project: $(esc "$PROJ_NAME") &nbsp;|&nbsp; Cluster: $(esc "$CLUSTER") &nbsp;|&nbsp; Instance ID: $(esc "$SID") &nbsp;|&nbsp; Status: $(esc "$SSTAT") &nbsp;|&nbsp; Generated: $STAMP &nbsp;|&nbsp; <a href='index.html'>&laquo; all instances</a></p>"
+    echo "<a id='$(esc "$ANCHOR")'></a><h3>Instance: $(esc "$SNAME") <span class='top'>(<a href='#top'>back to top</a>)</span></h3>"
+    echo "<p class='meta'>Instance ID: $(esc "$SID") &nbsp;|&nbsp; Status: $(esc "$SSTAT")</p>"
     echo "<table><col class='c1'><col class='c2'><col class='c3'><col class='c4'>"
-  } > "$FILE"
+  } >> "$FILE"
 
   banner "Validation Points"
 
@@ -264,26 +287,11 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
     "$(os_check "$IP" "pcs resource show 2>/dev/null | grep -Ei 'sql|db|galera' | head -3; systemctl is-active garbd galera 2>/dev/null" | blank_if_empty)" \
     "galera / DB resource in cluster" "DB cluster healthy, replication in sync"
 
-  echo '</table></body></html>' >> "$FILE"
-  INDEX+=("$FSAFE.html|$SNAME|$SSTAT|${IP:-$NA}|$SFLAV|${SHOST:-$NA}")
+  echo '</table>' >> "$FILE"
 done <<<"$SERVERS_TSV"
 
-# ------------------------------------------------------------------ index ----
-{
-  echo "<html><head><meta charset='utf-8'><title>Validation - $(esc "$PROJ_NAME")</title><style>$CSS</style></head><body>"
-  echo "<h2>Validation Checklists &ndash; $(esc "$PROJ_NAME")</h2>"
-  echo "<p class='meta'>Cluster: $(esc "$CLUSTER") &nbsp;|&nbsp; $PROJ_COUNT &nbsp;|&nbsp; Generated: $STAMP</p>"
-  echo "<table><col class='c1'><col class='c2'><col class='c3'><col class='c4'>"
-  echo "<tr><td class='sec' colspan='4'>Instances</td></tr>"
-  echo "<tr><td class='hdr'>Instance</td><td class='hdr'>Status / IP</td><td class='hdr'>Flavor</td><td class='hdr'>Compute Host</td></tr>"
-  for I in "${INDEX[@]}"; do
-    IFS='|' read -r F N S IPX FL H <<<"$I"
-    echo "<tr><td><a href='$(esc "$F")'>$(esc "$N")</a></td><td>$(esc "$S") / $(esc "$IPX")</td><td>$(esc "$FL")</td><td>$(esc "$H")</td></tr>"
-  done
-  echo "</table></body></html>"
-} > "$RUNDIR/index.html"
+echo '</body></html>' >> "$FILE"
 
 echo
-echo "Done. ${#INDEX[@]} checklist(s) written to: $RUNDIR"
-echo "  Start here: $RUNDIR/index.html"
+echo "Done. $COUNT instance(s) written to a single file: $FILE"
 [[ -z "$SSH_USER" ]] && echo "  Note: OS-level rows left as '$NA' (no -s <ssh-user> given)."
