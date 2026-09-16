@@ -1,1 +1,1005 @@
+---
+- name: Collect server details
+  hosts: "{{ hostname }}"
+  gather_facts: true
+  become: true
+
+  vars_prompt:
+   - name: hostname
+     prompt: What is a hostname?
+     private: no
+
+  vars:
+    #    project_name: IVR
+    physical_readiness_category_name: "Physical Readiness"
+    monitoring_category_name: "Monitoring"
+    availability_category_name: "Availability"
+    support_category_name: "Support and License"
+    configuration_category_name: "Configuration"
+    accessibility_category_name: "Accessibilty"
+    cluster_category_name: "Cluster"
+    atp_category_name: "ATP"
+    cpu_utilization_threshold: 80
+    memory_utilization_threshold: 80
+    # Password policy compliance targets (/etc/login.defs)
+    password_policy_max_days: 60
+    password_policy_min_days: 1
+    password_policy_warn_age: 10
+    crash_memory_threshold_gb: 32
+    satellite_host: "meylvrhsa01.corp.du.ae"
+    satellite_port: 443
+    satellite_timeout_seconds: 2
+    syslog_message_file: "/var/log/messages"      # override per-OS in host_vars if needed
+    ad_test_user: "cacmzl18"
+    ad_expected_domain: "corp.du.ae"   # override with -e "ad_expected_domain=your.domain" if different
+    sudoers_exempt_accounts:
+      - root
+      - sysadm
+      - dmidecode
+      - wheel
+      - qualyadm
+      - gsitdatabaseadministration
+
+  tasks:
+
+    - name: Check Packages
+      package_facts:
+        manager: auto
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+
+    - name: Set MDE status
+      set_fact:
+        mdatp_status: "{{ 'Running' if ansible_facts.services['mdatp.service'].state == 'running' else 'Not Running' }}"
+
+    - name: Check AD / Realm integration
+      command: realm list | grep corp.du.ae
+      register: realm_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set realm status
+      set_fact:
+        realm_status: "{{ 'Joined' if realm_check.stdout != '' else 'Not Joined' }}"
+
+
+    - name: Build mountpoint details
+      set_fact:
+        mountpoints: "{{ ansible_mounts }}"
+
+    - name: Get the last reboot timestamp
+      ansible.builtin.command: last reboot -n 1
+      register: last_reboot_result
+      changed_when: false
+
+    - name: Save collected data
+      set_fact:
+        server_report:
+          - hostname: "{{ ansible_hostname }}"
+            ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
+            os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+            kernel: "{{ ansible_kernel }}"
+            vcpus: "{{ ansible_processor_vcpus }}"
+            total_memory_mb: "{{ ansible_memtotal_mb }}"
+            mounts: "{{ mountpoints }}"
+            uptime: "{{ ansible_uptime_seconds | int // 3600 }} hours"
+            mdatp: "{{ mdatp_status }}"
+            realm: "{{ realm_status }}"
+            last_reboot: "{{ last_reboot_result.stdout }}"
+              #project: "{{ project_name }}"
+
+    - name: Determine system uptime in days
+      ansible.builtin.set_fact:
+        uptime_days: "{{ (ansible_uptime_seconds | default(0) | int) // 86400 }}"
+
+    - name: Set Uptime compliance result
+      ansible.builtin.set_fact:
+        uptime_compliance: >-
+          {{ 'Compliant' if (uptime_days | int) < 120 else 'Non-Compliant' }}
+        uptime_remarks: "Uptime: {{ uptime_days }} day(s)"
+
+    - name: Locate root filesystem mount facts
+      ansible.builtin.set_fact:
+        root_mount: "{{ (ansible_mounts | selectattr('mount', 'equalto', '/') | list | first) | default({}) }}"
+
+    - name: Calculate root filesystem disk utilization percentage
+      ansible.builtin.set_fact:
+        disk_used_percent: >-
+          {{ ((1 - ((root_mount.size_available | default(0) | int) /
+                     (root_mount.size_total | default(1) | int))) * 100) | round(2) }}
+      when: root_mount is defined and root_mount
+
+    - name: Set Disk Utilization compliance result
+      ansible.builtin.set_fact:
+        disk_compliance: >-
+          {{ 'Compliant' if (disk_used_percent | default(0) | float) < 80 else 'Non-Compliant' }}
+        disk_remarks: >-
+          {{ ('Disk usage on /: ' ~ disk_used_percent ~ '%') if disk_used_percent is defined
+             else 'Root filesystem not found' }}
+
+    # ------------------------------------------------------------------
+    # MONITORING - CPU UTILIZATION (applies to physical hosts AND VMs)
+    # Samples /proc/stat twice, 1 second apart, to compute % CPU busy time.
+    # ------------------------------------------------------------------
+    - name: Sample CPU utilization from /proc/stat
+      ansible.builtin.shell: |
+        set -o pipefail
+        read cpu user1 nice1 system1 idle1 iowait1 irq1 softirq1 steal1 rest < /proc/stat
+        sleep 1
+        read cpu user2 nice2 system2 idle2 iowait2 irq2 softirq2 steal2 rest < /proc/stat
+        total1=$((user1+nice1+system1+idle1+iowait1+irq1+softirq1+steal1))
+        total2=$((user2+nice2+system2+idle2+iowait2+irq2+softirq2+steal2))
+        idle_diff=$((idle2-idle1))
+        total_diff=$((total2-total1))
+        awk "BEGIN {printf \"%.2f\", (1 - ${idle_diff}/${total_diff}) * 100}"
+      args:
+        executable: /bin/bash
+      register: cpu_usage_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Set CPU Utilization compliance result
+      ansible.builtin.set_fact:
+        cpu_used_percent: "{{ cpu_usage_raw.stdout | default(0) | float }}"
+        cpu_compliance: >-
+          {{ 'Compliant' if (cpu_usage_raw.stdout | default(0) | float) < (cpu_utilization_threshold | float)
+             else 'Non-Compliant' }}
+        cpu_remarks: "CPU usage: {{ cpu_usage_raw.stdout | default('N/A') }}%"
+
+    - name: Calculate Memory Utilization perentage
+      ansible.builtin.set_fact:
+        memory_used_percent: >-
+          {{ ((1 - ((ansible_memfree_mb | default(0) | int) / (ansible_memtotal_mb | default(1) | int))) * 100) | round(2) }}
+
+    - name: Set Memory Utilization perentage
+      ansible.builtin.set_fact:
+        memory_compliance: >-
+          {{ 'Compliant' if (memory_used_percent | float) < (memory_utilization_threshold | float) else 'Non-Compliant' }}
+        memory_remarks: "Memory usage: {{ memory_used_percent }}% ({{ ansible_memtotal_mb | default('N/A') }} MB total)"
+
+    - name: Check SMTP (sendmail/postfix) configuration status
+      ansible.builtin.shell: |
+        set -o pipefail
+        if grep -q "DSsmtpint" /etc/mail/sendmail.cf 2>/dev/null && systemctl is-active --quiet sendmail 2>/dev/null; then
+          echo "Compliant|sendmail"
+        elif grep -q "smtpint" /etc/postfix/main.cf 2>/dev/null && systemctl is-active --quiet postfix 2>/dev/null; then
+          echo "Compliant|postfix"
+        else
+          echo "Non-Compliant|none"
+        fi
+      args:
+        executable: /bin/bash
+      register: smtp_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set SMTP Configured compliance result
+      ansible.builtin.set_fact:
+        smtp_compliance: "{{ (smtp_check.stdout | default('Non-Compliant|none')).split('|')[0] }}"
+        smtp_remarks: >-
+          {{ 'Postfix installed and running'
+             if ((smtp_check.stdout | default('Non-Compliant|none')).split('|')[1]) == 'postfix'
+             else ('sendmail installed and running'
+                   if ((smtp_check.stdout | default('Non-Compliant|none')).split('|')[1]) == 'sendmail'
+                   else '') }}
+
+    - name: Check cfg2html/Explorer configuration on OS
+      ansible.builtin.shell: |
+        set -o pipefail
+        if crontab -l 2>/dev/null | grep -qw cfg2html-linux && ls /usr/sbin/ 2>/dev/null | grep -q cfg2html-linux; then
+          echo "Compliant"
+        else
+          echo "Non-Compliant"
+        fi
+      args:
+        executable: /bin/bash
+      register: cfg2html_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set cfg2html compliance result
+      ansible.builtin.set_fact:
+        cfg2html_compliance: "{{ cfg2html_check.stdout | default('Non-Compliant') | trim }}"
+
+
+    - name: Get configured NTP/Chrony servers
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep server /etc/chrony.conf 2>/dev/null | grep -v "#"
+      args:
+        executable: /bin/bash
+      register: chrony_servers_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check chronyd service is active
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl is-active --quiet chronyd
+      args:
+        executable: /bin/bash
+      register: chronyd_active_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set Chrony/NTP compliance result
+      ansible.builtin.set_fact:
+        chrony_compliance: >-
+          {{ 'Compliant'
+             if ((chrony_servers_check.stdout | default('') | trim | length) > 0 and
+                 (chronyd_active_check.rc | default(1)) == 0)
+             else 'Non-Compliant' }}
+
+    - name: Set Chrony/NTP remarks
+      ansible.builtin.set_fact:
+        chrony_remarks: "{{ '' if chrony_compliance == 'Compliant' else 'Service is not running or NTP Server not configured' }}"
+
+    # ------------------------------------------------------------------
+    # CONFIGURATION - PASSWORD POLICY (/etc/login.defs)
+    # ------------------------------------------------------------------
+    - name: Gather password policy settings from /etc/login.defs
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -E "PASS_MAX_DAYS|PASS_MIN_DAYS|PASS_MIN_LEN|PASS_WARN_AGE" /etc/login.defs | grep -v "#"
+      args:
+        executable: /bin/bash
+      register: login_defs_check
+      changed_when: false
+      failed_when: false
+
+    - name: Extract individual password policy values
+      ansible.builtin.set_fact:
+        pass_max_days: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_MAX_DAYS\\s+(\\d+)') | first) | default('') }}"
+        pass_min_days: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_MIN_DAYS\\s+(\\d+)') | first) | default('') }}"
+        pass_min_len: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_MIN_LEN\\s+(\\d+)') | first) | default('') }}"
+        pass_warn_age: "{{ (login_defs_check.stdout | default('') | regex_findall('PASS_WARN_AGE\\s+(\\d+)') | first) | default('') }}"
+
+    - name: Set Password Policy compliance result
+      ansible.builtin.set_fact:
+        password_policy_compliance: >-
+          {{ 'Compliant'
+             if (pass_max_days == (password_policy_max_days | string) and
+                 pass_min_days == (password_policy_min_days | string) and
+                 pass_warn_age == (password_policy_warn_age | string))
+             else 'Non-Compliant' }}
+
+    - name: Set Password Policy resolution detail
+      ansible.builtin.set_fact:
+        password_policy_resolution: "{{ '' if password_policy_compliance == 'Compliant' else (login_defs_check.stdout | default('')) }}"
+
+    - name: Get total memory in GB
+      set_fact:
+        total_mem_gb: "{{ (ansible_memtotal_mb | int / 1024) | round(0, 'floor') | int }}"
+    
+    - name: Check if crash mountpoint exists
+      shell: df -h | grep -w crash
+      register: crash_mount_check
+      failed_when: false
+      changed_when: false
+    
+    - name: Evaluate crash dump compliance
+      set_fact:
+        crash_compliance: >-
+          {%- if total_mem_gb | int <= crash_memory_threshold_gb | int -%}
+          Compliant
+          {%- elif total_mem_gb | int > crash_memory_threshold_gb | int and crash_mount_check.rc == 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+    
+        crash_resolution: >-
+          {%- if total_mem_gb | int <= crash_memory_threshold_gb | int -%}
+          Crash mountpoint not needed, Total Memory ({{ total_mem_gb }}GB) is less than or equal to {{ crash_memory_threshold_gb }} GB
+          {%- elif crash_mount_check.rc == 0 -%}
+          Crash mountpoint present
+          {%- else -%}
+          No crash mountpoint found and Total Memory ({{ total_mem_gb }}GB) exceeds {{ crash_memory_threshold_gb }} GB
+          {%- endif -%}
+
+    - name: Test satellite endpoint connectivity
+      ansible.builtin.wait_for:
+        host: "{{ satellite_host }}"
+        port: "{{ satellite_port }}"
+        timeout: "{{ satellite_timeout_seconds }}"
+        state: started
+      register: sat_check
+      failed_when: false
+
+    - name: Evaluate satellite compliance
+      ansible.builtin.set_fact:
+        sat_compliance: "{{ 'Compliant' if sat_check.state is defined and sat_check.state == 'started' else 'Not Compliant' }}"
+        sat_status: "{{ satellite_host }}:{{ satellite_port }} {{ 'reachable' if sat_check.state is defined and sat_check.state == 'started' else 'unreachable' }}" 
+
+    - name: Check rsyslog service state
+      ansible.builtin.systemd:
+        name: rsyslog
+      register: rsyslog_service
+      failed_when: false
+
+    - name: Check syslog message file has content
+      ansible.builtin.stat:
+        path: "{{ syslog_message_file }}"
+      register: syslog_file_stat
+
+    - name: Evaluate syslog compliance
+      ansible.builtin.set_fact:
+        sys_compliance: >-
+          {%- if rsyslog_service.status is defined and rsyslog_service.status.ActiveState == 'active' and syslog_file_stat.stat.exists and syslog_file_stat.stat.size > 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        sys_remarks: >-
+          rsyslog active: {{ rsyslog_service.status.ActiveState | default('unknown') }},
+          {{ syslog_message_file }} exists: {{ syslog_file_stat.stat.exists | default(false) }},
+          size: {{ syslog_file_stat.stat.size | default(0) }} bytes
+
+    - name: Check Symantec status script result (if present)
+      ansible.builtin.command: /usr/lib/symantec/status.sh
+      register: symantec_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check mdatp (Microsoft Defender) service is active
+      ansible.builtin.systemd:
+        name: mdatp
+      register: mdatp_service
+      failed_when: false
+
+    - name: Evaluate antivirus compliance
+      ansible.builtin.set_fact:
+        mde_compliance: >-
+          {%- if symantec_check.rc != 0 and mdatp_service.status is defined and mdatp_service.status.ActiveState == 'active' -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        mde_remarks: >-
+          {%- if symantec_check.rc != 0 and mdatp_service.status is defined and mdatp_service.status.ActiveState == 'active' -%}
+          Symantec is deprecated. Microsoft Defender has been installed
+          {%- else -%}
+          Symantec is deprecated. Please install the Microsoft Defender
+          {%- endif -%}
+
+
+    # ------------------------------------------------------------------
+    # 5. HPOM monitoring agent check
+    # ------------------------------------------------------------------
+    - name: Check for running HPOM (OV) agent process
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -ef | grep '[O]V'
+      args:
+        executable: /bin/bash
+      register: hpom_process_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Evaluate HPOM compliance
+      ansible.builtin.set_fact:
+        hpom_compliance: "{{ 'Compliant' if hpom_process_check.rc == 0 else 'Not Compliant' }}"
+        hpom_remarks: >-
+          {%- if hpom_process_check.rc == 0 -%}
+          HPOM (OV) agent process running
+          {%- else -%}
+          Please secure approval from Mr. Shadi Trad and contact ITFaultPerformanceMgmt@du.ae team to install agent
+          {%- endif -%}
+ 
+    # ------------------------------------------------------------------
+    # 6. SAR utility check
+    # ------------------------------------------------------------------
+    - name: Check sar utility is installed and runnable
+      ansible.builtin.command: sar
+      register: sar_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Evaluate SAR compliance
+      ansible.builtin.set_fact:
+        sar_compliance: "{{ 'Compliant' if sar_check.rc == 0 else 'Non-Compliant' }}"
+        sar_remarks: >-
+          {%- if sar_check.rc == 0 -%}
+          sar responded successfully
+          {%- elif sar_check.rc is defined and sar_check.msg is defined and 'not found' in (sar_check.msg | default('')) -%}
+          sar command not found - sysstat package likely not installed
+          {%- else -%}
+          sar returned non-zero exit code ({{ sar_check.rc | default('n/a') }}) - check sysstat service/config
+          {%- endif -%}
+
+    # ------------------------------------------------------------------
+    # 8. EDR check (HIDS/Fidelis and Trellix deprecation confirmation)
+    # ------------------------------------------------------------------
+    - name: Check for Fidelis (endpoint.service) unit file
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-unit-files | grep -q '^endpoint.service'
+      args:
+        executable: /bin/bash
+      register: fidelis_unit_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Check for Trellix (xagt) unit file
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-unit-files | grep -q 'xagt'
+      args:
+        executable: /bin/bash
+      register: trellix_unit_check
+      changed_when: false
+      failed_when: false
+ 
+    - name: Evaluate EDR deprecation compliance
+      ansible.builtin.set_fact:
+        ep_compliance: >-
+          {%- if fidelis_unit_check.rc != 0 and trellix_unit_check.rc != 0 -%}
+          Compliant
+          {%- else -%}
+          Non-Compliant
+          {%- endif -%}
+        ep_remarks: >-
+          {%- if fidelis_unit_check.rc != 0 and trellix_unit_check.rc != 0 -%}
+          Fidelis and Trellix has been deprecated.
+          {%- elif fidelis_unit_check.rc != 0 and trellix_unit_check.rc == 0 -%}
+          Trellix (xagt) unit still present - Fidelis is deprecated.
+          {%- elif fidelis_unit_check.rc == 0 and trellix_unit_check.rc != 0 -%}
+          Fidelis (endpoint.service) unit still present.
+          {%- else -%}
+          Fidelis (endpoint.service) and Trellix (xagt) units still present.
+          {%- endif -%}
+
+    - name: Identify sudoers accounts with ALL privileges (excluding approved admins)
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep "(ALL)" /etc/sudoers 2>/dev/null | grep -Ev "^#|{{ sudoers_exempt_accounts | join('|') }}" | awk '{print $1}'
+      args:
+        executable: /bin/bash
+      register: sudoers_extra_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set root access restriction compliance result
+      ansible.builtin.set_fact:
+        sudoers_extra_users: "{{ sudoers_extra_check.stdout_lines | default([]) }}"
+        sudoers_compliance: >-
+          {{ 'Non-Compliant' if (sudoers_extra_check.stdout_lines | default([]) | length) > 0 else 'Compliant' }}
+        sudoers_resolution: >-
+          {{ ('%s have root access' % (sudoers_extra_check.stdout_lines | default([]) | join(', ')))
+             if (sudoers_extra_check.stdout_lines | default([]) | length) > 0 else '' }}
+        sudoers_remarks: >-
+          {{ 'Root Access can be revoked post handover'
+             if (sudoers_extra_check.stdout_lines | default([]) | length) > 0 else '' }}
+
+
+
+    # ------------------------------------------------------------------
+    # CLUSTER - Pacemaker/Corosync (only evaluated if pcs/cluster tooling
+    # is present; otherwise every item is marked Not Applicable)
+    # ------------------------------------------------------------------
+    - name: Check if this host is part of a Pacemaker/Corosync cluster
+      ansible.builtin.shell: |
+        set -o pipefail
+        command -v pcs >/dev/null 2>&1 && pcs status >/dev/null 2>&1
+      args:
+        executable: /bin/bash
+      register: cluster_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set cluster availability fact
+      ansible.builtin.set_fact:
+        is_cluster: "{{ (cluster_check.rc | default(1)) == 0 }}"
+
+    - name: Check Pacemaker cluster node status
+      ansible.builtin.shell: |
+        set -o pipefail
+        pcs cluster status 2>/dev/null | grep Online
+      args:
+        executable: /bin/bash
+      register: cls_check
+      changed_when: false
+      failed_when: false
+      when: is_cluster
+
+    - name: Check corosync heartbeat/totem token value
+      ansible.builtin.shell: |
+        set -o pipefail
+        corosync-cmapctl 2>/dev/null | grep totem.token | grep -v '\.totem\.token'
+      args:
+        executable: /bin/bash
+      register: totem_check
+      changed_when: false
+      failed_when: false
+      when: is_cluster
+
+    - name: Check kdump/fence resource grouping in Pacemaker
+      ansible.builtin.shell: |
+        set -o pipefail
+        pcs resource 2>/dev/null | grep -E "vmfence|kdump"
+      args:
+        executable: /bin/bash
+      register: kf_check
+      changed_when: false
+      failed_when: false
+      when: is_cluster
+
+    - name: Set cluster sub-check compliance results
+      ansible.builtin.set_fact:
+        cls_compliance: "{{ 'Compliant' if (cls_check.rc | default(1)) == 0 else 'Non-Compliant' }}"
+        totem_compliance: "{{ 'Compliant' if (totem_check.stdout | default('') | trim | length) > 0 else 'Non-Compliant' }}"
+        kf_compliance: "{{ 'Compliant' if (kf_check.rc | default(1)) != 0 else 'Non-Compliant' }}"
+      when: is_cluster
+
+    - name: Build Cluster row set when cluster is available
+      ansible.builtin.set_fact:
+        cluster_rows:
+          - description_item: "Cluster Healthcheck. All vendor specific parameters to be configured. Timeout to be configured, failover test, vMotion test etc."
+            compliance: "Pending"
+            resolution: ""
+            status: ""
+            remarks: "Unix Ops to Validate"
+          - description_item: "Cluster health check"
+            compliance: "{{ cls_compliance }}"
+            resolution: "{{ cls_check.stdout | default('') | trim }}"
+            status: ""
+            remarks: ""
+          - description_item: "heartbeat/totem token value"
+            compliance: "{{ totem_compliance }}"
+            resolution: "{{ totem_check.stdout | default('') | trim }}"
+            status: ""
+            remarks: ""
+          - description_item: "Kdump and Fence resources should not be part of any resource group"
+            compliance: "{{ kf_compliance }}"
+            resolution: ""
+            status: "{{ (kf_check.stdout | default('') | trim) if kf_compliance == 'Non-Compliant' else '' }}"
+            remarks: ""
+      when: is_cluster
+
+    # ------------------------------------------------------------------
+    # 4. Guardium agent (GIM) check
+    # ------------------------------------------------------------------
+    - name: Check for oracle OS user
+      ansible.builtin.command: getent passwd oracle
+      register: oracle_user_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check for running GIM process
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -ef | grep '[g]im'
+      args:
+        executable: /bin/bash
+      register: gim_process_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check for running Oracle PMON process
+      ansible.builtin.shell: |
+        set -o pipefail
+        ps -ef | grep '[p]mon'
+      args:
+        executable: /bin/bash
+      register: pmon_process_check
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate Guardium compliance
+      ansible.builtin.set_fact:
+        gim_compliance: >-
+          {%- if oracle_user_check.rc == 0 and gim_process_check.rc == 0 -%}
+          Compliant
+          {%- elif pmon_process_check.rc != 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        gim_remarks: >-
+          {%- if oracle_user_check.rc == 0 and gim_process_check.rc == 0 -%}
+          Guardium agent running
+          {%- elif pmon_process_check.rc != 0 -%}
+          No Database available (no Oracle PMON process running)
+          {%- else -%}
+          Please secure ISRM approval for Guardium Installation
+          {%- endif -%}
+
+    - name: Determine domain join status via realm
+      ansible.builtin.command: realm list
+      register: realm_list_check
+      changed_when: false
+      failed_when: false
+
+    - name: Confirm AD user resolves via NSS (getent passwd)
+      ansible.builtin.command: "getent passwd '{{ ad_test_user }}'"
+      register: getent_check
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate domain-name match compliance
+      ansible.builtin.set_fact:
+        realm_compliance: >-
+          {%- if realm_list_check.rc == 0 and ad_expected_domain in (realm_list_check.stdout | default('')) and getent_check.rc == 0 -%}
+          Compliant
+          {%- else -%}
+          Not Compliant
+          {%- endif -%}
+        realm_status: >-
+          {%- if realm_list_check.rc == 0 and ad_expected_domain in (realm_list_check.stdout | default('')) -%}
+          realm list shows domain '{{ ad_expected_domain }}'
+          {%- else -%}
+          realm list did not show expected domain '{{ ad_expected_domain }}' - host may not be domain joined
+          {%- endif -%}
+
+    # ------------------------------------------------------------------
+    # Consolidate this host's rows, grouped by category
+    # ------------------------------------------------------------------
+    - name: Build Physical Readiness row set for this host
+      ansible.builtin.set_fact:
+        physical_readiness_rows:
+          - description_item: "Power Redundancy on Server"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable on Virtual Machine"
+          - description_item: "Power Redundancy on RACK"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable on Virtual Machine"
+          - description_item: "Network Redundancy"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable on Virtual Machine"
+          - description_item: "Server Labelling"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable on Virtual Machine"
+          - description_item: "Power/Network/Fibre Labelling"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "Server Normal Shutdown and application redundancy test"
+            compliance: "Complaint"
+            resolution: ""
+            status: ""
+            remarks: ""
+          - description_item: "Structered Cabling"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "HBA Redundancy"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "LED / Panel Status (Any Amber / Error Messages)"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "Remote Console Access"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+
+    - name: Build Availability row set for this host
+      ansible.builtin.set_fact:
+        availability_rows:
+          - description_item: "Internal Disks Mirror and boot from both mirror disk"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "Network Teaming and test status"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "OS Recovery Solution"
+            compliance: "Complaint"
+            resolution: "Backup Snapshot restore"
+            status: ""
+            remarks: "VMware Machine"
+
+    - name: Build Software and License for this host
+      ansible.builtin.set_fact:
+        support_rows:
+          - description_item: "Availability of OS Support from Vender"
+            compliance: "Compliant"
+            resolution: ""
+            status: ""
+            remarks: "Redhat/VMware support license"
+          - description_item: "Availability of HW Support"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable in  VMware Machine"
+          - description_item: "ILO Licensed"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "OS and Cluster Subscriptions to be provided"
+            compliance: "Compliant"
+            resolution: ""
+            status: ""
+            remarks: "Standard Support License"
+          - description_item: "Licenses for Installed softwares"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Project Managemnet to provide"
+
+    - name: Build Monitoring row set for this host
+      ansible.builtin.set_fact:
+        monitoring_rows:
+          - description_item: "Current Filesystem threshold level(<80%)"
+            compliance: "{{ disk_compliance }}"
+            resolution: ""
+            status: "{{ disk_remarks }}"
+            remarks: ""
+          - description_item: "Current CPU Threshold level (<80%)"
+            compliance: "{{ cpu_compliance }}"
+            resolution: ""
+            status: "{{ cpu_remarks }}"
+            remarks: ""
+          - description_item: "Current Memory Threshold level (<80%)"
+            compliance: "{{ memory_compliance }}"
+            resolution: ""
+            status: "{{ memory_remarks }}"
+            remarks: ""
+          - description_item: "Uptime"
+            compliance: "{{ uptime_compliance }}"
+            resolution: ""
+            status: "{{ uptime_remarks }}"
+            remarks: ""
+
+    - name: Build Configuration row for this host
+      ansible.builtin.set_fact:
+        configuration_rows:
+          - description_item: "Synchronization with NTP/Chrony Server and ensure 4 NTP servers should be configured on upcoming project"
+            compliance: "{{ chrony_compliance }}"
+            resolution: "{{ chrony_servers_check.stdout | default('') | trim }}"
+            status: ""
+            remarks: "{{ chrony_remarks }}"
+          - description_item: "SMTP Configured"
+            compliance: " {{smtp_compliance}} "
+            resolution: ""
+            status: ""
+            remarks: " {{smtp_remarks }} "
+          - description_item: "Crash dump configured with enough Space and to be configured as sperate file system if memory >= 32GB"
+            compliance: "{{ crash_compliance }}"
+            resolution: "{{ crash_resolution }}"
+            status: "total_mem_gb ~ ' GB'"
+            remarks: ""
+
+    - name: Build Accessibilty row for this host
+      ansible.builtin.set_fact:
+        accessibility_rows:
+          - description_item: "Remote Console(ILO/MP) Accessbility and password to be shared for ILO and chassis information"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable in  VMware Machine"
+          - description_item: "System Accessibility from ducorp/vpn/ssl/citrix and VDI ( Masdar and IMPZ)"
+            compliance: "Compliant"
+            resolution: ""
+            status: ""
+            remarks: "VM is accessible through VDI"
+          - description_item: "No user in sudoers/rbac with root privilege"
+            compliance: "{{ sudoers_compliance }}"
+            resolution: "{{ sudoers_resolution }}"
+            status: "{{ sudoers_remarks }}"
+            remarks: ""
+
+    - name: Build Cluster row for this host
+      ansible.builtin.set_fact:
+        cluster_rows:
+          - description_item: "Cluster Healthcheck.All Vendor specific parameters to be configured.Time out tobe configured,failover test ,vmotion test etc"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "No redhat cluster"
+          - description_item: "Cluster health check"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "No redhat cluster"
+          - description_item: "heartbeat/totem token value"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "No redhat cluster"
+          - description_item: "Validate fencing device configuration"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "No redhat cluster"
+          - description_item: "Stonith Levels to be added (kdump First - Fence - Second)"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "No redhat cluster"
+          - description_item: "Access of fencing device vmfence"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "No redhat cluster"
+      when: not is_cluster
+
+    - name: Build ATP row for this host
+      ansible.builtin.set_fact:
+        atp_rows:
+          - description_item: "Power Redundancy check"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not applicable for VM"
+          - description_item: "Server Normal Shutdown and application redundancy test"
+            compliance: "Compliant"
+            resolution: ""
+            status: ""
+            remarks: ""
+          - description_item: "Server Normal Startup"
+            compliance: "Compliant"
+            resolution: ""
+            status: ""
+            remarks: ""
+          - description_item: "HBA Redundancy Check"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not applicable for VM"
+          - description_item: "Network Redundancy Check"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not applicable for VM"
+          - description_item: "Alternate Boot check"
+            compliance: "Compliant"
+            resolution: "Restore from Snapshot Backup"
+            status: ""
+            remarks: "VMware Machine"
+          - description_item: "Password Policy compliance"
+            compliance: "{{ password_policy_compliance }}"
+            resolution: "{{ password_policy_resolution }}"
+            status: ""
+            remarks: ""
+          - description_item: "Application team to confirm no root filesystem is used for application day to day activity no root dependacy for application team to view /read/rotate application logs or configration files and no application cron jobs under root user"
+            compliance: "Pending"
+            resolution: ""
+            status: ""
+            remarks: "Application team to confirm"
+          - description_item: "Vmware team alignmnet for Vmware server handover"
+            compliance: "Pending"
+            resolution: ""
+            status: ""
+            remarks: "VMware team to confirm"
+          - description_item: "root password restriction (Only sys admins are allowed to use root)"
+            compliance: "{{ sudoers_compliance }}"
+            resolution: ""
+            status: "{{ sudoers_remarks }}"
+            remarks: ""
+          - description_item: "Explorer or cfg2html configuration on OS"
+            compliance: "{{ cfg2html_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: ""
+          - description_item: "AD integration validate by adding own ID and login"
+            compliance: "{{ realm_compliance }}"
+            resolution: ""
+            status: "{{ realm_status }}"
+            remarks: ""
+          - description_item: "Anti Virus"
+            compliance: "{{ mde_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ mde_remarks }}"
+          - description_item: "HIDS/Fidelis and Trellix has been depreciated confirmation by TSRM"
+            compliance: "{{ ep_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ ep_remarks }}"
+          - description_item: "HPOM Monitoring agents"
+            compliance: "{{ hpom_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ hpom_remarks }}"
+          - description_item: "Guardium Agent installation and confirmation by TSRM"
+            compliance: "{{ gim_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ gim_remarks }}"
+          - description_item: "Syslog integration and confirmation by TSRM"
+            compliance: "{{ sys_compliance }}"
+            resolution: ""
+            status: ""
+            remarks: "{{ sys_remarks }}"
+          - description_item: "Flar Image backup"
+            compliance: "Not Applicable"
+            resolution: ""
+            status: ""
+            remarks: "Not Applicable in VM"
+          - description_item: "Validate the server with DCR sheet for compute resourcec ,IP ,subnet"
+            compliance: "Compliant"
+            resolution: ""
+            status: ""
+            remarks: ""
+          - description_item: "OVPA perfoamnce graph should report the perfomance"
+            compliance: "Pending"
+            resolution: ""
+            status: ""
+            remarks: "Project team to request ITFaultPerformanceMgmt@du to provide OVA performance reports"
+          - description_item: "Sar utility to be installed and configured"
+            compliance: "{{ sar_compliance }}"
+            resolution: ""
+            status: "{{ sar_remarks }}"
+            remarks: ""
+          - description_item: "Ensure satellite communication should be enabled"
+            compliance: "{{ sat_compliance }}"
+            resolution: ""
+            status: "{{ sat_status }}"
+            remarks: ""
+          - description_item: "Ansible communication should be enabled"
+            compliance: "Pending"
+            resolution: ""
+            status: ""
+            remarks: "	Unix Ops to confirm"
+
+    - name: Build combined category list for this host
+      ansible.builtin.set_fact:
+        compliance_categories:
+          - category: "{{ physical_readiness_category_name }}"
+            rows: "{{ physical_readiness_rows }}"
+          - category: "{{ availability_category_name }}"
+            rows: "{{ availability_rows }}"
+          - category: "{{ monitoring_category_name }}"
+            rows: "{{ monitoring_rows }}"
+          - category: "{{ configuration_category_name }}"
+            rows: "{{ configuration_rows }}"
+          - category: "{{ accessibility_category_name }}"
+            rows: "{{ accessibility_rows }}"
+          - category: "{{ support_category_name }}"
+            rows: "{{ support_rows }}"
+          - category: "{{ cluster_category_name }}"
+            rows: "{{ cluster_rows }}"
+          - category: "{{ atp_category_name }}"
+            rows: "{{ atp_rows }}"
+
+- name: Generate HTML report and send email
+  hosts: localhost
+  run_once: true
+  vars:
+    report_file: /tmp/server_audit.html
+  vars_prompt:
+   - name: project_name
+     prompt: Project Name?
+     private: no
+   - name: cdr_no
+     prompt: Jira CDR No?
+     private: no
+   - name: archer_id
+     prompt: Archer ID Demand?
+     private: no
+
+  tasks:
+
+    - name: Generate HTML report
+      template:
+        src: report.html.j2
+        dest: "{{ report_file }}"
+      vars:
+        report_hosts: "{{ groups['m2m'] }}"
+
+    - name: Rename file using mv
+      ansible.builtin.command: >
+        mv -f /tmp/server_audit.html /tmp/{{ project_name }}_server_report.html
 
