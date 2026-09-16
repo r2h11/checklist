@@ -264,28 +264,88 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   r "Instances OVA Custome OS if any" "$OVA" "Heuristic on image name - verify manually" "Custom/OVA image boots correctly"
 
   # ---------------------------- OS level ----------------------------
+  # Sourced primarily from Nova instance properties/tags (no SSH needed).
+  # Convention this script looks for -- set these on the instance yourself:
+  #   openstack server set --property db_status="active, mysqld"      <server>
+  #   openstack server set --property db_cluster="galera, 3 nodes"    <server>
+  #   openstack server set --property os_cluster="pacemaker, online"  <server>
+  #   openstack image set  --property os_distro=rhel --property os_version=8.6  <image>
+  # If a property is missing AND -s <ssh-user> was given, the script falls
+  # back to a live SSH check for that one row. If neither is available, the
+  # row is left "Not Available" rather than guessed.
   banner "OS Level Validation Points"
 
-  OSV=$(os_check "$IP" ". /etc/os-release 2>/dev/null; echo \$PRETTY_NAME \$(uname -r)")
-  r "Installed OS version" "${OSV:-$NA}" "${SSH_USER:+via ssh $IP}" "Same OS + kernel as before"
+  prop() { echo "$DETAIL" | jqx "(d.get('properties') or {}).get('$1','') or ''"; }
 
-  OSH=$(os_check "$IP" "hostname -f")
-  if [[ -n "$OSH" ]]; then
-    if [[ "${OSH%% *}" == "$SNAME"* ]]; then M="MATCH"; else M="MISMATCH"; fi
-    r "OS hostname and Instance are same" "$OSH - $M" "Nova name: $SNAME" "OS hostname == Nova instance name"
+  # -- Installed OS version: prefer Glance image properties (os_distro/os_version) --
+  IMAGE_ID=$(echo "$DETAIL" | jqx "(d.get('image') or {}).get('id','') if isinstance(d.get('image'), dict) else ''")
+  OS_FROM_IMAGE=""
+  if [[ -n "$IMAGE_ID" ]]; then
+    IMG_JSON=$(os image show "$IMAGE_ID" -f json)
+    OS_FROM_IMAGE=$(echo "$IMG_JSON" | jqx "'/'.join(x for x in [(d.get('properties') or {}).get('os_distro',''), (d.get('properties') or {}).get('os_version','')] if x)")
+  fi
+  if [[ -n "$OS_FROM_IMAGE" ]]; then
+    r "Installed OS version" "$OS_FROM_IMAGE" "From image metadata (os_distro/os_version) on '$ROOT'" "Same OS + kernel as before"
   else
-    r "OS hostname and Instance are same" "$NA" "Nova name: $SNAME" "OS hostname == Nova instance name"
+    OSV=$(os_check "$IP" ". /etc/os-release 2>/dev/null; echo \$PRETTY_NAME \$(uname -r)")
+    if [[ -n "$OSV" ]]; then
+      r "Installed OS version" "$OSV" "${SSH_USER:+via ssh $IP (image had no os_distro/os_version property)}" "Same OS + kernel as before"
+    else
+      r "Installed OS version" "$NA" "No os_distro/os_version on image '$ROOT'${SSH_USER:+, and ssh check found nothing}" "Same OS + kernel as before"
+    fi
   fi
 
-  r "OS level cluster configured" \
-    "$(os_check "$IP" "pcs status 2>/dev/null | head -3 || crm status 2>/dev/null | head -3 || systemctl is-active pacemaker corosync 2>/dev/null" | blank_if_empty)" \
-    "pcs / crm / pacemaker" "Cluster online, all nodes joined"
-  r "DB is running" \
-    "$(os_check "$IP" "systemctl is-active mysqld mariadb postgresql 2>/dev/null | paste -sd, -; ps -ef | grep -Ec '[m]ysqld|[p]ostgres|[o]ra_pmon'" | blank_if_empty)" \
-    "Service state + process count" "DB service active and accepting connections"
-  r "DB level cluster is configured" \
-    "$(os_check "$IP" "pcs resource show 2>/dev/null | grep -Ei 'sql|db|galera' | head -3; systemctl is-active garbd galera 2>/dev/null" | blank_if_empty)" \
-    "galera / DB resource in cluster" "DB cluster healthy, replication in sync"
+  # -- OS hostname: from Nova only, no in-guest verification unless -s given --
+  if [[ -n "$SSH_USER" ]]; then
+    OSH=$(os_check "$IP" "hostname -f")
+    if [[ -n "$OSH" ]]; then
+      if [[ "${OSH%% *}" == "$SNAME"* ]]; then M="MATCH"; else M="MISMATCH"; fi
+      r "OS hostname and Instance are same" "$OSH - $M" "Nova name: $SNAME (verified via ssh)" "OS hostname == Nova instance name"
+    else
+      r "OS hostname and Instance are same" "$NA" "Nova name: $SNAME (ssh check failed)" "OS hostname == Nova instance name"
+    fi
+  else
+    r "OS hostname and Instance are same" "$SNAME" "From Nova instance name only - not verified in-guest" "OS hostname == Nova instance name"
+  fi
+
+  # -- OS level cluster --
+  VAL=$(prop os_cluster)
+  if [[ -n "$VAL" ]]; then
+    r "OS level cluster configured" "$VAL" "From instance property 'os_cluster'" "Cluster online, all nodes joined"
+  else
+    VAL=$(os_check "$IP" "pcs status 2>/dev/null | head -3 || crm status 2>/dev/null | head -3 || systemctl is-active pacemaker corosync 2>/dev/null")
+    if [[ -n "$SSH_USER" ]]; then
+      r "OS level cluster configured" "$(echo "$VAL" | blank_if_empty)" "No 'os_cluster' property set; checked via ssh" "Cluster online, all nodes joined"
+    else
+      r "OS level cluster configured" "$NA" "No 'os_cluster' property set on instance - set with: openstack server set --property os_cluster=\"...\" $SNAME" "Cluster online, all nodes joined"
+    fi
+  fi
+
+  # -- DB running --
+  VAL=$(prop db_status)
+  if [[ -n "$VAL" ]]; then
+    r "DB is running" "$VAL" "From instance property 'db_status'" "DB service active and accepting connections"
+  else
+    VAL=$(os_check "$IP" "systemctl is-active mysqld mariadb postgresql 2>/dev/null | paste -sd, -; ps -ef | grep -Ec '[m]ysqld|[p]ostgres|[o]ra_pmon'")
+    if [[ -n "$SSH_USER" ]]; then
+      r "DB is running" "$(echo "$VAL" | blank_if_empty)" "No 'db_status' property set; checked via ssh" "DB service active and accepting connections"
+    else
+      r "DB is running" "$NA" "No 'db_status' property set on instance - set with: openstack server set --property db_status=\"...\" $SNAME" "DB service active and accepting connections"
+    fi
+  fi
+
+  # -- DB level cluster --
+  VAL=$(prop db_cluster)
+  if [[ -n "$VAL" ]]; then
+    r "DB level cluster is configured" "$VAL" "From instance property 'db_cluster'" "DB cluster healthy, replication in sync"
+  else
+    VAL=$(os_check "$IP" "pcs resource show 2>/dev/null | grep -Ei 'sql|db|galera' | head -3; systemctl is-active garbd galera 2>/dev/null")
+    if [[ -n "$SSH_USER" ]]; then
+      r "DB level cluster is configured" "$(echo "$VAL" | blank_if_empty)" "No 'db_cluster' property set; checked via ssh" "DB cluster healthy, replication in sync"
+    else
+      r "DB level cluster is configured" "$NA" "No 'db_cluster' property set on instance - set with: openstack server set --property db_cluster=\"...\" $SNAME" "DB cluster healthy, replication in sync"
+    fi
+  fi
 
   echo '</table>' >> "$FILE"
 done <<<"$SERVERS_TSV"
