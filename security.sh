@@ -40,8 +40,15 @@ OUTPUT="${2:-compliance_matrix.html}"
 
 # ---------- helpers ----------
 esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
-# turn literal \n into <br> after escaping
-nl2br() { esc "$1" | sed 's/\\n/<br>/g'; }
+# turn literal \n into <br>, and simple markdown emphasis into HTML, after escaping.
+# Supports:  ***bold italic***   **bold**   *italic*
+# Usage inside a field, e.g.:  ***Establish and maintain...***\nThe solution shall...
+nl2br() {
+  esc "$1" | sed 's/\\n/<br>/g' \
+    | sed -E 's/\*\*\*([^*]+)\*\*\*/<strong><em>\1<\/em><\/strong>/g' \
+    | sed -E 's/\*\*([^*]+)\*\*/<strong>\1<\/strong>/g' \
+    | sed -E 's/\*([^*]+)\*/<em>\1<\/em>/g'
+}
 trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 b64() { base64 < "$1" | tr -d '\n'; }
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
