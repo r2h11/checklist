@@ -131,19 +131,25 @@ if [[ -z "$CLUSTER" ]]; then
   CLUSTER=$(sed -E 's#https?://##; s#[:/].*##' <<<"${AUTH:-$NA}")
 fi
 
-QUOTA=$(openstack "${OS_OPTS[@]}" quota show "$PROJ_ID" -f json 2>/dev/null); [[ -z "$QUOTA" ]] && QUOTA='{}'
-LIMITS=$(openstack "${OS_OPTS[@]}" limits show --absolute --project "$PROJ_ID" -f json 2>/dev/null); [[ -z "$LIMITS" ]] && LIMITS='[]'
-
-q() {  # q <key> [limits-name]
+q() {  # q <column>
   local v
-  v=$(jq -r --arg k "$1" '.[$k] // .[($k|gsub("_";"-"))] // .[($k|gsub("-";"_"))] // empty' <<<"$QUOTA")
-  if [[ -z "$v" && -n "${2:-}" ]]; then
-    v=$(jq -r --arg n "$2" '[.[]|select(.Name==$n)|.Value][0] // empty' <<<"$LIMITS")
-  fi
+  v=$(openstack "${OS_OPTS[@]}" quota show "$PROJ_ID" -f value -c "$1" 2>/dev/null)
   echo "${v:--}"
 }
 
-QUOTA_TXT="vCPU: $(q cores maxTotalCores) | RAM(MB): $(q ram maxTotalRAMSize) | Instances: $(q instances maxTotalInstances) | Volumes: $(q volumes) | Gigabytes: $(q gigabytes) | Snapshots: $(q snapshots) | Floating IPs: $(q floating_ips maxTotalFloatingIps) | Sec-Groups: $(q secgroups maxSecurityGroups) | Networks: $(q networks) | Ports: $(q ports)"
+ql() {  # ql <limits-name>
+  local v
+  v=$(openstack "${OS_OPTS[@]}" limits show --absolute --project "$PROJ_ID" -f value -c Name -c Value 2>/dev/null \
+      | awk -v n="$1" '$1==n{print $2}')
+  echo "${v:--}"
+}
+
+CORES=$(q cores);      [[ "$CORES" == "-" ]] && CORES=$(ql maxTotalCores)
+RAM=$(q ram);          [[ "$RAM" == "-" ]] && RAM=$(ql maxTotalRAMSize)
+INSTANCES=$(q instances); [[ "$INSTANCES" == "-" ]] && INSTANCES=$(ql maxTotalInstances)
+FLOATING=$(q floating-ips); [[ "$FLOATING" == "-" ]] && FLOATING=$(ql maxTotalFloatingIps)
+
+QUOTA_TXT="vCPU: $CORES | RAM(MB): $RAM | Instances: $INSTANCES | Volumes: $(q volumes) | Gigabytes: $(q gigabytes) | Snapshots: $(q snapshots) | Floating IPs: $FLOATING | Sec-Groups: $(q secgroups) | Networks: $(q networks) | Ports: $(q ports)"
 
 SERVERS=$(os server list --project "$PROJ_ID" --long -f json); [[ -z "$SERVERS" ]] && SERVERS='[]'
 TOTAL=$(echo "$SERVERS"   | jqx "len(d)")
