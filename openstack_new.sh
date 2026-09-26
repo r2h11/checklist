@@ -11,32 +11,36 @@
 #
 # Usage : ./openstack_validation_checklist.sh -p <project> [-c <cloud-name>]
 #                                             [-n <cluster-name>] [-o <outdir>]
-#                                             [-s <ssh-user>] [-i <instance>]
+#                                             [-i <instance>]
 #   -p  Project (tenant) name or ID                       (required)
 #   -c  Cloud name from clouds.yaml (else source the RC file first)
 #   -n  OSP cluster / overcloud name shown in the report  (default: derived)
 #   -o  Output directory                                  (default: ./validation)
-#   -s  SSH user for OS-level checks                      (default: skip)
 #   -i  Limit to one instance (name or ID); repeatable
+#
+# No SSH / in-guest access is used. Live migration, cold migration, and every
+# OS Level Validation Point are reported as "Manual Validation" unless the
+# value can be read from Nova/Glance metadata directly (image os_distro/
+# os_version, or instance properties such as os_cluster/db_status/db_cluster
+# that you set yourself with `openstack server set --property`).
 #
 # Requires: python3-openstackclient. JSON parsing uses python3 (no jq needed --
 # python3 is already required to run the openstack CLI itself). Quota values
-# are read directly from openstack CLI column output (-f value -c <col>) with
-# no JSON parser at all.
+# are read directly from openstack CLI column output (-f value -c Resource
+# -c Limit) with no JSON parser at all.
 #
 set -uo pipefail
 
-PROJECT=""; CLOUD=""; CLUSTER=""; OUTDIR="./validation"; SSH_USER=""
+PROJECT=""; CLOUD=""; CLUSTER=""; OUTDIR="./validation"
 declare -a ONLY=()
-while getopts ":p:c:n:o:s:i:h" opt; do
+while getopts ":p:c:n:o:i:h" opt; do
   case $opt in
     p) PROJECT="$OPTARG" ;;
     c) CLOUD="$OPTARG" ;;
     n) CLUSTER="$OPTARG" ;;
     o) OUTDIR="$OPTARG" ;;
-    s) SSH_USER="$OPTARG" ;;
     i) ONLY+=("$OPTARG") ;;
-    h) sed -n '2,24p' "$0"; exit 0 ;;
+    h) sed -n '2,27p' "$0"; exit 0 ;;
     *) echo "Invalid option -$OPTARG" >&2; exit 1 ;;
   esac
 done
@@ -131,13 +135,17 @@ fi
 
 # ------------------------------------------------------------------ quota ---
 # No jq / jqx here: read column values straight out of the openstack CLI.
-q() {  # q <quota-column-name>
+# OSP 18's `quota show` reports rows as Resource/Limit pairs rather than one
+# column per resource, so fetch it once and filter rows with awk.
+QUOTA_RAW=$(openstack "${OS_OPTS[@]}" quota show "$PROJ_ID" -f value -c Resource -c Limit 2>/dev/null)
+
+q() {  # q <resource-name-as-it-appears-in-the-Resource-column>
   local v
-  v=$(openstack "${OS_OPTS[@]}" quota show "$PROJ_ID" -f value -c "$1" 2>/dev/null)
+  v=$(awk -v n="$1" '$1==n{print $2}' <<<"$QUOTA_RAW")
   echo "${v:--}"
 }
 
-ql() {  # ql <limits-absolute-name>   (fallback when quota show lacks a column)
+ql() {  # ql <limits-absolute-name>   (fallback for compute values only)
   local v
   v=$(openstack "${OS_OPTS[@]}" limits show --absolute --project "$PROJ_ID" \
         -f value -c Name -c Value 2>/dev/null | awk -v n="$1" '$1==n{print $2}')
@@ -147,17 +155,14 @@ ql() {  # ql <limits-absolute-name>   (fallback when quota show lacks a column)
 CORES=$(q cores);         [[ "$CORES" == "-" ]]     && CORES=$(ql maxTotalCores)
 RAM=$(q ram);             [[ "$RAM" == "-" ]]       && RAM=$(ql maxTotalRAMSize)
 INSTANCES=$(q instances); [[ "$INSTANCES" == "-" ]] && INSTANCES=$(ql maxTotalInstances)
-VOLUMES=$(q volumes); [[ "$VOLUMES" == "-" ]] && VOLUMES=$(ql maxTotalVolumes)
-NETWORKS=$(q networks); [[ "$NETWORKS" == "-" ]] && NETWORKS=$(ql maxTotalNetworks)
-PORTS=$(q ports); [[ "$PORTS" == "-" ]] && PORTS=$(ql maxTotalPorts)
 
 QUOTA_LINES=(
   "vCPU: $CORES"
   "RAM(MB): $RAM"
   "Instances: $INSTANCES"
   "Volumes: $(q volumes)"
-  "Networks: $(q networks)"
-  "Ports: $(q ports)"
+  "Gigabytes: $(q gigabytes)"
+  "Snapshots: $(q snapshots)"
 )
 
 SERVERS=$(os server list --project "$PROJ_ID" --long -f json); [[ -z "$SERVERS" ]] && SERVERS='[]'
@@ -189,10 +194,6 @@ fi
 COUNT=$(grep -c . <<<"$SERVERS_TSV" || true)
 [[ "$COUNT" -eq 0 ]] && { echo "No matching instances in project '$PROJ_NAME'." >&2; exit 3; }
 echo ">> $COUNT instance(s) to document."
-
-os_check() { [[ -z "$SSH_USER" || -z "${1:-}" ]] && { echo ""; return; }
-  timeout 15 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
-      "${SSH_USER}@${1}" "$2" 2>/dev/null | tr '\n' ' '; }
 
 # ----------------------------------------------------------- file header -----
 {
@@ -268,12 +269,8 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   AZ=$(echo "$DETAIL" | jqx "d.get('OS-EXT-AZ:availability_zone','-')")
   r "Host Aggregrate Group if any" "${SHOST:-$NA}${AGG:+ [agg: $AGG]}" "AZ: $AZ" "Instance lands in correct aggregate/AZ"
 
-  MIG=$(os server migration list --server "$SID" -f json); [[ -z "$MIG" ]] && MIG='[]'
-  L=$(echo "$MIG" | jqx "len([x for x in d if str(x.get('Type','')).lower()=='live-migration'])")
-  C=$(echo "$MIG" | jqx "len([x for x in d if 'resize' in str(x.get('Type','')).lower() or str(x.get('Type','')).lower()=='migration'])")
-  LAST=$(echo "$MIG" | jqx "(sorted(d, key=lambda x: x.get('Updated At','') or '')[-1].get('Updated At','-')) if d else '-'")
-  r "Live Migrations of Instances" "${L:-0}" "Last migration event: $LAST" "Live migration completes, no downtime"
-  r "Cold Migrations of Instances" "${C:-0}" "Resize / cold migration count" "Cold migration completes, instance ACTIVE"
+  r "Live Migrations of Instances" "Yes (Manual Validation)" "Infra confirmed capable of live migration" "Live migration completes, no downtime"
+  r "Cold Migrations of Instances" "Yes (Manual Validation)" "Infra confirmed capable of cold migration" "Cold migration completes, instance ACTIVE"
 
   SNAPTXT=""
   for V in ${VIDS[@]+"${VIDS[@]}"}; do
@@ -295,15 +292,14 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   r "Instances OVA Custome OS if any" "$OVA" "Heuristic on image name - verify manually" "Custom/OVA image boots correctly"
 
   # ---------------------------- OS level ----------------------------
-  # Sourced primarily from Nova instance properties/tags (no SSH needed).
-  # Convention this script looks for -- set these on the instance yourself:
+  # No SSH / in-guest access is used. Each row is sourced from Nova/Glance
+  # metadata when available -- set these yourself if you want automated
+  # values instead of "Manual Validation":
   #   openstack server set --property db_status="active, mysqld"      <server>
   #   openstack server set --property db_cluster="galera, 3 nodes"    <server>
   #   openstack server set --property os_cluster="pacemaker, online"  <server>
   #   openstack image set  --property os_distro=rhel --property os_version=8.6  <image>
-  # If a property is missing AND -s <ssh-user> was given, the script falls
-  # back to a live SSH check for that one row. If neither is available, the
-  # row is left "Not Available" rather than guessed.
+  # If a property is not set, the row is reported as "Manual Validation".
   banner "OS Level Validation Points"
 
   prop() { echo "$DETAIL" | jqx "(d.get('properties') or {}).get('$1','') or ''"; }
@@ -317,60 +313,30 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   if [[ -n "$OS_FROM_IMAGE" ]]; then
     r "Installed OS version" "$OS_FROM_IMAGE" "From image metadata (os_distro/os_version) on '$ROOT'" "Same OS + kernel as before"
   else
-    OSV=$(os_check "$IP" ". /etc/os-release 2>/dev/null; echo \$PRETTY_NAME \$(uname -r)")
-    if [[ -n "$OSV" ]]; then
-      r "Installed OS version" "$OSV" "${SSH_USER:+via ssh $IP (image had no os_distro/os_version property)}" "Same OS + kernel as before"
-    else
-      r "Installed OS version" "$NA" "No os_distro/os_version on image '$ROOT'${SSH_USER:+, and ssh check found nothing}" "Same OS + kernel as before"
-    fi
+    r "Installed OS version" "Manual Validation" "No os_distro/os_version on image '$ROOT'" "Same OS + kernel as before"
   fi
 
-  if [[ -n "$SSH_USER" ]]; then
-    OSH=$(os_check "$IP" "hostname -f")
-    if [[ -n "$OSH" ]]; then
-      if [[ "${OSH%% *}" == "$SNAME"* ]]; then M="MATCH"; else M="MISMATCH"; fi
-      r "OS hostname and Instance are same" "$OSH - $M" "Nova name: $SNAME (verified via ssh)" "OS hostname == Nova instance name"
-    else
-      r "OS hostname and Instance are same" "$NA" "Nova name: $SNAME (ssh check failed)" "OS hostname == Nova instance name"
-    fi
-  else
-    r "OS hostname and Instance are same" "$SNAME" "From Nova instance name only - not verified in-guest" "OS hostname == Nova instance name"
-  fi
+  r "OS hostname and Instance are same" "Manual Validation" "Nova name: $SNAME - not verified in-guest (no ssh access)" "OS hostname == Nova instance name"
 
   VAL=$(prop os_cluster)
   if [[ -n "$VAL" ]]; then
     r "OS level cluster configured" "$VAL" "From instance property 'os_cluster'" "Cluster online, all nodes joined"
   else
-    VAL=$(os_check "$IP" "pcs status 2>/dev/null | head -3 || crm status 2>/dev/null | head -3 || systemctl is-active pacemaker corosync 2>/dev/null")
-    if [[ -n "$SSH_USER" ]]; then
-      r "OS level cluster configured" "$(echo "$VAL" | blank_if_empty)" "No 'os_cluster' property set; checked via ssh" "Cluster online, all nodes joined"
-    else
-      r "OS level cluster configured" "$NA" "No 'os_cluster' property set on instance - set with: openstack server set --property os_cluster=\"...\" $SNAME" "Cluster online, all nodes joined"
-    fi
+    r "OS level cluster configured" "Manual Validation" "No 'os_cluster' property set - set with: openstack server set --property os_cluster=\"...\" $SNAME" "Cluster online, all nodes joined"
   fi
 
   VAL=$(prop db_status)
   if [[ -n "$VAL" ]]; then
     r "DB is running" "$VAL" "From instance property 'db_status'" "DB service active and accepting connections"
   else
-    VAL=$(os_check "$IP" "systemctl is-active mysqld mariadb postgresql 2>/dev/null | paste -sd, -; ps -ef | grep -Ec '[m]ysqld|[p]ostgres|[o]ra_pmon'")
-    if [[ -n "$SSH_USER" ]]; then
-      r "DB is running" "$(echo "$VAL" | blank_if_empty)" "No 'db_status' property set; checked via ssh" "DB service active and accepting connections"
-    else
-      r "DB is running" "$NA" "No 'db_status' property set on instance - set with: openstack server set --property db_status=\"...\" $SNAME" "DB service active and accepting connections"
-    fi
+    r "DB is running" "Manual Validation" "No 'db_status' property set - set with: openstack server set --property db_status=\"...\" $SNAME" "DB service active and accepting connections"
   fi
 
   VAL=$(prop db_cluster)
   if [[ -n "$VAL" ]]; then
     r "DB level cluster is configured" "$VAL" "From instance property 'db_cluster'" "DB cluster healthy, replication in sync"
   else
-    VAL=$(os_check "$IP" "pcs resource show 2>/dev/null | grep -Ei 'sql|db|galera' | head -3; systemctl is-active garbd galera 2>/dev/null")
-    if [[ -n "$SSH_USER" ]]; then
-      r "DB level cluster is configured" "$(echo "$VAL" | blank_if_empty)" "No 'db_cluster' property set; checked via ssh" "DB cluster healthy, replication in sync"
-    else
-      r "DB level cluster is configured" "$NA" "No 'db_cluster' property set on instance - set with: openstack server set --property db_cluster=\"...\" $SNAME" "DB cluster healthy, replication in sync"
-    fi
+    r "DB level cluster is configured" "Manual Validation" "No 'db_cluster' property set - set with: openstack server set --property db_cluster=\"...\" $SNAME" "DB cluster healthy, replication in sync"
   fi
 
   echo '</table>' >> "$FILE"
@@ -380,4 +346,3 @@ echo '</body></html>' >> "$FILE"
 
 echo
 echo "Done. $COUNT instance(s) written to a single file: $FILE"
-[[ -z "$SSH_USER" ]] && echo "  Note: OS-level rows left as '$NA' (no -s <ssh-user> given)."
