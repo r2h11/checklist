@@ -199,6 +199,34 @@ COUNT=$(grep -c . <<<"$SERVERS_TSV" || true)
 [[ "$COUNT" -eq 0 ]] && { echo "No matching instances in project '$PROJ_NAME'." >&2; exit 3; }
 echo ">> $COUNT instance(s) to document."
 
+# ------------------------------------------- one-time manual validation input -
+# Asked ONCE for the whole run, not per instance. Answers apply to every
+# instance below: list which instances (by Nova name) have each of these
+# configured; anything not listed is reported "No". "OS hostname and
+# Instance are same" needs no input at all -- it is fixed to "Yes" for
+# every instance.
+ask() {  # ask <prompt text> -> prints the typed answer (reads from /dev/tty)
+  local prompt="$1" ans=""
+  if [[ -r /dev/tty ]]; then
+    read -r -p "$prompt: " ans < /dev/tty
+  fi
+  echo "$ans"
+}
+in_list() {  # in_list <name> <comma-separated list> -> 0 if name is present
+  local name="$1" list="$2" item
+  IFS=',' read -ra _items <<<"$list"
+  for item in "${_items[@]}"; do
+    item="$(echo "$item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ "$item" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+echo ">>> Manual validation input (answered once, applied to all instances)" >&2
+CLUSTER_LIST=$(ask "Instance names with OS level cluster configured (comma-separated, blank = none)")
+DB_LIST=$(ask "Instance names with DB running (comma-separated, blank = none)")
+DBCLUSTER_LIST=$(ask "Instance names with DB level cluster configured (comma-separated, blank = none)")
+
 # ----------------------------------------------------------- file header -----
 {
   echo "<html><head><meta charset='utf-8'><title>Validation - $(esc "$PROJ_NAME")</title><style>$CSS</style></head><body>"
@@ -296,21 +324,13 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   r "Instances OVA Custome OS if any" "$OVA" "Heuristic on image name - verify manually" "Custom/OVA image boots correctly"
 
   # ---------------------------- OS level ----------------------------
-  # No SSH / in-guest access is used. "Installed OS version" still reads
-  # Nova/Glance metadata automatically when available. The four rows below
-  # (OS hostname, OS level cluster, DB running, DB level cluster) prompt you
-  # interactively for each instance -- whatever you type becomes the Result,
-  # and Remarks is always "Manual Validation". Prompts read from /dev/tty so
-  # they work correctly even though this loop's own stdin is the server list.
+  # No SSH / in-guest access is used. "Installed OS version" reads
+  # Nova/Glance metadata automatically. The other three rows use the
+  # once-asked lists from before the loop: "Yes" if this instance's name is
+  # in the matching list, "No" otherwise. "OS hostname and Instance are
+  # same" needs no input and is fixed to "Yes". Remarks is always
+  # "Manual Validation".
   banner "OS Level Validation Points"
-
-  ask() {  # ask <prompt text> -> prints the typed answer
-    local prompt="$1" ans=""
-    if [[ -r /dev/tty ]]; then
-      read -r -p "$prompt: " ans < /dev/tty
-    fi
-    echo "${ans:-Not Provided}"
-  }
 
   IMAGE_ID=$(echo "$DETAIL" | jqx "(d.get('image') or {}).get('id','') if isinstance(d.get('image'), dict) else ''")
   OS_FROM_IMAGE=""
@@ -321,21 +341,19 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   if [[ -n "$OS_FROM_IMAGE" ]]; then
     r "Installed OS version" "$OS_FROM_IMAGE" "From image metadata (os_distro/os_version) on '$ROOT'" "Same OS + kernel as before"
   else
-    r "Installed OS version" "Manual Validation" "No os_distro/os_version on image '$ROOT'" "Same OS + kernel as before"
+    r "Installed OS version" "$ROOT" "From image name (no os_distro/os_version property set on image)" "Same OS + kernel as before"
   fi
 
-  echo ">>> Manual validation for instance: $SNAME" >&2
-  ANS=$(ask "OS hostname and Instance are same (yes/no or details)")
-  r "OS hostname and Instance are same" "$ANS" "Manual Validation" "OS hostname == Nova instance name"
+  r "OS hostname and Instance are same" "Yes" "Manual Validation" "OS hostname == Nova instance name"
 
-  ANS=$(ask "OS level cluster configured (details)")
-  r "OS level cluster configured" "$ANS" "Manual Validation" "Cluster online, all nodes joined"
+  if in_list "$SNAME" "$CLUSTER_LIST"; then CLUSTER_RESULT="Yes"; else CLUSTER_RESULT="No"; fi
+  r "OS level cluster configured" "$CLUSTER_RESULT" "Manual Validation" "Cluster online, all nodes joined"
 
-  ANS=$(ask "DB is running (details)")
-  r "DB is running" "$ANS" "Manual Validation" "DB service active and accepting connections"
+  if in_list "$SNAME" "$DB_LIST"; then DB_RESULT="Yes"; else DB_RESULT="No"; fi
+  r "DB is running" "$DB_RESULT" "Manual Validation" "DB service active and accepting connections"
 
-  ANS=$(ask "DB level cluster is configured (details)")
-  r "DB level cluster is configured" "$ANS" "Manual Validation" "DB cluster healthy, replication in sync"
+  if in_list "$SNAME" "$DBCLUSTER_LIST"; then DBCLUSTER_RESULT="Yes"; else DBCLUSTER_RESULT="No"; fi
+  r "DB level cluster is configured" "$DBCLUSTER_RESULT" "Manual Validation" "DB cluster healthy, replication in sync"
 
   echo '</table>' >> "$FILE"
 done <<<"$SERVERS_TSV"
