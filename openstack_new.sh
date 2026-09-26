@@ -18,11 +18,15 @@
 #   -o  Output directory                                  (default: ./validation)
 #   -i  Limit to one instance (name or ID); repeatable
 #
-# No SSH / in-guest access is used. Live migration, cold migration, and every
-# OS Level Validation Point are reported as "Manual Validation" unless the
-# value can be read from Nova/Glance metadata directly (image os_distro/
-# os_version, or instance properties such as os_cluster/db_status/db_cluster
-# that you set yourself with `openstack server set --property`).
+# No SSH / in-guest access is used. Live migration and cold migration are
+# reported as "Yes (Manual Validation)" (infra is confirmed capable).
+# "Installed OS version" reads Nova/Glance metadata automatically when
+# available (image os_distro/os_version). The remaining four OS-level rows
+# -- OS hostname, OS level cluster configured, DB is running, DB level
+# cluster is configured -- prompt you interactively at the terminal for each
+# instance; your typed answer becomes the Result, and Remarks always reads
+# "Manual Validation". Run this in an interactive terminal (not fully
+# backgrounded/piped) so the prompts can read from /dev/tty.
 #
 # Requires: python3-openstackclient. JSON parsing uses python3 (no jq needed --
 # python3 is already required to run the openstack CLI itself). Quota values
@@ -292,17 +296,21 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   r "Instances OVA Custome OS if any" "$OVA" "Heuristic on image name - verify manually" "Custom/OVA image boots correctly"
 
   # ---------------------------- OS level ----------------------------
-  # No SSH / in-guest access is used. Each row is sourced from Nova/Glance
-  # metadata when available -- set these yourself if you want automated
-  # values instead of "Manual Validation":
-  #   openstack server set --property db_status="active, mysqld"      <server>
-  #   openstack server set --property db_cluster="galera, 3 nodes"    <server>
-  #   openstack server set --property os_cluster="pacemaker, online"  <server>
-  #   openstack image set  --property os_distro=rhel --property os_version=8.6  <image>
-  # If a property is not set, the row is reported as "Manual Validation".
+  # No SSH / in-guest access is used. "Installed OS version" still reads
+  # Nova/Glance metadata automatically when available. The four rows below
+  # (OS hostname, OS level cluster, DB running, DB level cluster) prompt you
+  # interactively for each instance -- whatever you type becomes the Result,
+  # and Remarks is always "Manual Validation". Prompts read from /dev/tty so
+  # they work correctly even though this loop's own stdin is the server list.
   banner "OS Level Validation Points"
 
-  prop() { echo "$DETAIL" | jqx "(d.get('properties') or {}).get('$1','') or ''"; }
+  ask() {  # ask <prompt text> -> prints the typed answer
+    local prompt="$1" ans=""
+    if [[ -r /dev/tty ]]; then
+      read -r -p "$prompt: " ans < /dev/tty
+    fi
+    echo "${ans:-Not Provided}"
+  }
 
   IMAGE_ID=$(echo "$DETAIL" | jqx "(d.get('image') or {}).get('id','') if isinstance(d.get('image'), dict) else ''")
   OS_FROM_IMAGE=""
@@ -316,28 +324,18 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
     r "Installed OS version" "Manual Validation" "No os_distro/os_version on image '$ROOT'" "Same OS + kernel as before"
   fi
 
-  r "OS hostname and Instance are same" "Manual Validation" "Nova name: $SNAME - not verified in-guest (no ssh access)" "OS hostname == Nova instance name"
+  echo ">>> Manual validation for instance: $SNAME" >&2
+  ANS=$(ask "OS hostname and Instance are same (yes/no or details)")
+  r "OS hostname and Instance are same" "$ANS" "Manual Validation" "OS hostname == Nova instance name"
 
-  VAL=$(prop os_cluster)
-  if [[ -n "$VAL" ]]; then
-    r "OS level cluster configured" "$VAL" "From instance property 'os_cluster'" "Cluster online, all nodes joined"
-  else
-    r "OS level cluster configured" "Manual Validation" "No 'os_cluster' property set - set with: openstack server set --property os_cluster=\"...\" $SNAME" "Cluster online, all nodes joined"
-  fi
+  ANS=$(ask "OS level cluster configured (details)")
+  r "OS level cluster configured" "$ANS" "Manual Validation" "Cluster online, all nodes joined"
 
-  VAL=$(prop db_status)
-  if [[ -n "$VAL" ]]; then
-    r "DB is running" "$VAL" "From instance property 'db_status'" "DB service active and accepting connections"
-  else
-    r "DB is running" "Manual Validation" "No 'db_status' property set - set with: openstack server set --property db_status=\"...\" $SNAME" "DB service active and accepting connections"
-  fi
+  ANS=$(ask "DB is running (details)")
+  r "DB is running" "$ANS" "Manual Validation" "DB service active and accepting connections"
 
-  VAL=$(prop db_cluster)
-  if [[ -n "$VAL" ]]; then
-    r "DB level cluster is configured" "$VAL" "From instance property 'db_cluster'" "DB cluster healthy, replication in sync"
-  else
-    r "DB level cluster is configured" "Manual Validation" "No 'db_cluster' property set - set with: openstack server set --property db_cluster=\"...\" $SNAME" "DB cluster healthy, replication in sync"
-  fi
+  ANS=$(ask "DB level cluster is configured (details)")
+  r "DB level cluster is configured" "$ANS" "Manual Validation" "DB cluster healthy, replication in sync"
 
   echo '</table>' >> "$FILE"
 done <<<"$SERVERS_TSV"
