@@ -324,24 +324,23 @@ while IFS=$'\t' read -r SID SNAME SSTAT SFLAV SHOST SNET; do
   r "Instances OVA Custome OS if any" "$OVA" "Heuristic on image name - verify manually" "Custom/OVA image boots correctly"
 
   # ---------------------------- OS level ----------------------------
-  # No SSH / in-guest access is used. "Installed OS version" reads
-  # Nova/Glance metadata automatically. The other three rows use the
-  # once-asked lists from before the loop: "Yes" if this instance's name is
-  # in the matching list, "No" otherwise. "OS hostname and Instance are
-  # same" needs no input and is fixed to "Yes". Remarks is always
-  # "Manual Validation".
+  # No SSH / in-guest access is used. "Installed OS version" reads the
+  # instance property 'os_name' (set with:
+  #   openstack server set --property os_name="..." <server>
+  # ) via a plain openstack CLI + awk pipeline -- no jq/jqx/python parsing.
+  # Falls back to the image name if the property isn't set. The other three
+  # rows use the once-asked lists from before the loop: "Yes" if this
+  # instance's name is in the matching list, "No" otherwise. "OS hostname
+  # and Instance are same" needs no input and is fixed to "Yes". Remarks is
+  # always "Manual Validation".
   banner "OS Level Validation Points"
 
-  IMAGE_ID=$(echo "$DETAIL" | jqx "(d.get('image') or {}).get('id','') if isinstance(d.get('image'), dict) else ''")
-  OS_FROM_IMAGE=""
-  if [[ -n "$IMAGE_ID" ]]; then
-    IMG_JSON=$(os image show "$IMAGE_ID" -f json)
-    OS_FROM_IMAGE=$(echo "$IMG_JSON" | jqx "'/'.join(x for x in [(d.get('properties') or {}).get('os_distro',''), (d.get('properties') or {}).get('os_version','')] if x)")
-  fi
-  if [[ -n "$OS_FROM_IMAGE" ]]; then
-    r "Installed OS version" "$OS_FROM_IMAGE" "From image metadata (os_distro/os_version) on '$ROOT'" "Same OS + kernel as before"
+  OS_NAME=$(openstack "${OS_OPTS[@]}" server show "$SID" -f value -c properties 2>/dev/null \
+              | awk -F "os_name':" '{print $2}' | awk -F "'" '{print $2}')
+  if [[ -n "$OS_NAME" ]]; then
+    r "Installed OS version" "$OS_NAME" "From instance property 'os_name'" "Same OS + kernel as before"
   else
-    r "Installed OS version" "$ROOT" "From image name (no os_distro/os_version property set on image)" "Same OS + kernel as before"
+    r "Installed OS version" "$ROOT" "From image name (no 'os_name' property set on instance)" "Same OS + kernel as before"
   fi
 
   r "OS hostname and Instance are same" "Yes" "Manual Validation" "OS hostname == Nova instance name"
