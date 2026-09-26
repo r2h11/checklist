@@ -147,17 +147,15 @@ ql() {  # ql <limits-absolute-name>   (fallback when quota show lacks a column)
 CORES=$(q cores);         [[ "$CORES" == "-" ]]     && CORES=$(ql maxTotalCores)
 RAM=$(q ram);             [[ "$RAM" == "-" ]]       && RAM=$(ql maxTotalRAMSize)
 INSTANCES=$(q instances); [[ "$INSTANCES" == "-" ]] && INSTANCES=$(ql maxTotalInstances)
-FLOATING=$(q floating-ips); [[ "$FLOATING" == "-" ]] && FLOATING=$(ql maxTotalFloatingIps)
+VOLUMES=$(q volumes); [[ "$VOLUMES" == "-" ]] && VOLUMES=$(ql maxTotalVolumes)
+NETWORKS=$(q networks); [[ "$NETWORKS" == "-" ]] && NETWORKS=$(ql maxTotalNetworks)
+PORTS=$(q ports); [[ "$PORTS" == "-" ]] && PORTS=$(ql maxTotalPorts)
 
 QUOTA_LINES=(
   "vCPU: $CORES"
   "RAM(MB): $RAM"
   "Instances: $INSTANCES"
   "Volumes: $(q volumes)"
-  "Gigabytes: $(q gigabytes)"
-  "Snapshots: $(q snapshots)"
-  "Floating IPs: $FLOATING"
-  "Sec-Groups: $(q secgroups)"
   "Networks: $(q networks)"
   "Ports: $(q ports)"
 )
